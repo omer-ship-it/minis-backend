@@ -1,0 +1,6 @@
+@MinisBackend_HostAddress = http://localhost:5087
+
+GET {{MinisBackend_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###

@@ -1,0 +1,24 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.5.2.0
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "MinisBackend", "MinisBackend.csproj", "{B9C8A2BF-DB82-AECC-F830-AAB1D8D767FC}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{B9C8A2BF-DB82-AECC-F830-AAB1D8D767FC}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{B9C8A2BF-DB82-AECC-F830-AAB1D8D767FC}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{B9C8A2BF-DB82-AECC-F830-AAB1D8D767FC}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{B9C8A2BF-DB82-AECC-F830-AAB1D8D767FC}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {DA3A7CAE-5906-4D6C-9388-0445BB68B16A}
+	EndGlobalSection
+EndGlobal
