@@ -13,3 +13,4 @@ Backend service for the minis project.
 ## CI test
 
 Triggering the PR workflow.
+Trigger main CI
