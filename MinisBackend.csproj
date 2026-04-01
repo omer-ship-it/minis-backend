@@ -12,7 +12,8 @@
   </ItemGroup>
 
   <ItemGroup>
-    <Content Update="minis-web/**">
+    <Content Remove="minis-web/**" />
+    <Content Include="minis-web/**">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
     </Content>

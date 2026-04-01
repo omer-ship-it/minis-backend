@@ -1,17 +1,332 @@
 <!doctype html>
 <html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>minis-web</title>
-  <link rel="manifest" href="manifest.json" />
-  <link rel="stylesheet" href="css/styles.css" />
-</head>
-<body>
-  <main>
-    <h1>minis-web</h1>
-  </main>
 
-  <script src="js/app.js"></script>
+<head>
+    <script src="https://js.stripe.com/v3/"></script>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+    <meta name="theme-color" content="#324E57" />
+    <link rel="manifest" href="manifest.json" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" crossorigin="anonymous" />
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Heebo:wght@400;500;700;800;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="css/styles.css" />
+    <title>MINIS</title>
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="MINIS" />
+    <link rel="apple-touch-icon" href="/icons/pwa-192.png" />
+</head>
+
+<body>
+
+    <div id="bootLoader" class="bootLoader" aria-hidden="false">
+        <div class="bootLoaderInner">
+            <img id="bootLogo"
+                 class="bootLogo"
+                 src="https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcRGMGDvxwcKJs56QWm3Dgoa86FAi-hQKvYhXg&s"
+                 alt="בית העם" />
+            <div class="bootLoaderTitle">בית העם</div>
+        </div>
+    </div>
+    <header class="top headerBar">
+        <button class="headerIcon left" aria-label="Member card" onclick="openMembersGate()">
+            <i style="font-size:20px" class="fa-solid fa-mug-saucer"></i>
+        </button>
+
+        <div class="headerCenter">
+            <div class="h1" id="shopTitle"></div>
+            <div class="h2" id="shopSubtitle"></div>
+        </div>
+
+        <button class="headerIcon right" aria-label="Share" onclick="openShareSheet()">
+            <i style="font-size:20px" class="fa-solid fa-share-from-square"></i>
+        </button>
+    </header>
+
+    <div class="serviceWrap" id="serviceWrap">
+        <div class="serviceSeg" id="serviceSeg">
+            <div class="serviceBg"></div>
+            <div class="serviceIndicator" id="serviceIndicator"></div>
+            <button class="segBtn" id="segSit" type="button"></button>
+            <button class="segBtn" id="segTa" type="button"></button>
+        </div>
+    </div>
+    <div class="serviceWrap" id="locationWrap">
+        <div class="serviceSeg" id="locationSeg">
+            <div class="serviceBg"></div>
+            <div class="serviceIndicator" id="locationIndicator"></div>
+            <button class="segBtn" id="locBtn1" type="button"></button>
+            <button class="segBtn" id="locBtn2" type="button"></button>
+            <button class="segBtn" id="locBtn3" type="button"></button>
+            <button class="segBtn" id="locBtn4" type="button"></button>
+        </div>
+    </div>
+
+    <div id="orderBannerHost" class="orderBannerWrap"></div>
+    <div id="birthdayBannerHost" class="orderBannerWrap"></div>
+    <div id="myItemsHost" class="myItemsWrap hidden"></div>
+
+    <div id="stickySentinel"></div>
+    <div id="catsSpacer"></div>
+    <div class="stickyWrap" id="stickyWrap">
+        <div class="categoryBar" id="cats"></div>
+    </div>
+
+    <main id="menu"></main>
+
+    <div class="basketBar hidden" id="basketBar">
+        <button class="basketBtn" onclick="openBasket()">
+            <div class="basketQty" id="basketQty">0</div>
+            <div id="basketLabel">View order</div>
+            <div class="basketTotal" id="basketTotal">0.00</div>
+        </button>
+    </div>
+
+    <div class="modal productModal" id="productModal">
+        <div class="backdrop" onclick="closeProduct()"></div>
+        <div class="cardModal">
+            <div class="sheetTop">
+                <button class="close" onclick="closeProduct()">✕</button>
+            </div>
+            <div class="modalBody" id="productBody"></div>
+            <div class="modalBottom" id="productBottom"></div>
+        </div>
+    </div>
+
+    <div class="modal" id="basketModal">
+        <div class="backdrop" onclick="closeBasket()"></div>
+        <div class="cardModal">
+            <div class="sheetTop sheetHeader">
+                <div class="sheetTitle" id="basketSheetTitle"></div>
+                <button class="close" onclick="closeBasket()">✕</button>
+            </div>
+            <div class="modalBody" id="basketBody"></div>
+            <div class="modalBottom" id="basketBottom"></div>
+        </div>
+    </div>
+
+    <div class="confirmView" id="confirmView" aria-hidden="true">
+        <div class="confirmNav">
+            <button class="confirmBack" type="button" onclick="closeConfirmation()">
+                <i class="fa-solid fa-chevron-left"></i>
+            </button>
+            <div class="confirmTitle">Confirmation</div>
+            <div style="width:40px"></div>
+        </div>
+
+        <div class="confirmBody">
+            <div class="confirmCard confirmThanks">
+                <div class="confirmH1">Thank you!</div>
+                <div class="confirmH2">Your order number</div>
+                <div class="confirmOrderId" id="confirmOrderId">0000</div>
+                <div class="confirmH3" id="confirmStatus">We’ll notify you when it’s ready</div>
+            </div>
+
+            <div id="downloadIncentive" class="confirmCard downloadCard">
+                <div class="downloadTitle"></div>
+
+                <div class="downloadBullets">
+                    <div class="bullet">• <span></span></div>
+                    <div class="bullet">• <span></span></div>
+                    <div class="bullet">• <span></span></div>
+                </div>
+
+                <button class="downloadBtn" onclick="onDownloadTap()"></button>
+            </div>
+
+            <div class="confirmCard">
+                <div class="confirmSectionTitle">Order details</div>
+                <div id="confirmItems"></div>
+
+                <div class="confirmTotalRow">
+                    <div class="confirmTotalLabel">Total</div>
+                    <div class="confirmTotalVal" id="confirmTotalVal">£0.00</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="modal" id="memberModal">
+        <div class="backdrop" onclick="closeMemberCard()"></div>
+        <div class="cardModal">
+            <div class="sheetTop sheetHeader">
+                <div class="sheetTitle">כרטיסייה</div>
+                <button class="close" onclick="closeMemberCard()">✕</button>
+            </div>
+            <div class="modalBody" id="memberBody"></div>
+        </div>
+    </div>
+
+    <div class="modal" id="shareModal">
+        <div class="backdrop" onclick="closeShareSheet()"></div>
+        <div class="cardModal">
+            <div class="sheetTop sheetHeader">
+                <div class="sheetTitle" id="shareTitle">Share</div>
+                <button class="close" onclick="closeShareSheet()">✕</button>
+            </div>
+
+            <div class="modalBody">
+                <div class="shareWrap">
+                    <canvas id="qrCanvas" class="qrCanvas"></canvas>
+
+                    <div class="shareActions">
+                        <button class="shareActionBtn" onclick="shareLink()">
+                            <i class="fa-solid fa-share-from-square"></i>
+                            <div class="shareActionLabel">Share</div>
+                        </button>
+
+                        <button class="shareActionBtn" onclick="copyLink()">
+                            <i class="fa-solid fa-link"></i>
+                            <div class="shareActionLabel">Copy link</div>
+                        </button>
+                    </div>
+
+                    <div class="shareToast hidden" id="shareToast">Link copied</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="modal" id="studentModal">
+        <div class="backdrop" onclick="closeStudentSheet()"></div>
+        <div class="cardModal studentCard">
+            <div class="sheetTop sheetHeader">
+                <div class="sheetTitle">🎓</div>
+            </div>
+
+            <div class="modalBody studentBody">
+                <div class="studentTitle">הטבת סטודנטים הופעלה</div>
+                <div class="studentSubtitle" id="studentSubtitle">הנחה של 10% להזמנות באפליקציה</div>
+            </div>
+
+            <div class="modalBottom studentBottom">
+                <button class="studentBtn" type="button" onclick="closeStudentSheet()">המשך לתפריט</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="modal" id="detailsModal">
+        <div class="backdrop" onclick="closeDetailsSheet()"></div>
+        <div class="cardModal">
+            <div class="sheetTop sheetHeader">
+                <div class="sheetTitle">Your details</div>
+                <button class="close" onclick="closeDetailsSheet()">✕</button>
+            </div>
+
+            <div class="modalBody">
+                <div class="detailsStack">
+                    <label class="detailsLabel">Full name</label>
+                    <input id="detailsName" class="detailsInput" type="text" autocomplete="name" placeholder="Full name" />
+
+                    <div>
+                        <label class="detailsLabel">Phone</label>
+                        <input id="detailsPhone" class="detailsInput" type="tel" inputmode="tel" autocomplete="tel" placeholder="Phone number" style="margin-top:10px" />
+                    </div>
+
+                    <button id="detailsContinueBtn" class="detailsBtn" type="button" onclick="saveDetailsAndContinue()">Continue</button>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="modal" id="membersModal">
+        <div class="backdrop" onclick="closeMembersClub()"></div>
+
+        <div class="cardModal studentCard">
+            <div class="sheetTop sheetHeader" id="membersHeader">
+                <div class="sheetTitle" style="font-size:50px !important">☕️</div>
+                <button class="close" onclick="closeMembersClub()">✕</button>
+            </div>
+
+            <div class="modalBody studentBody" id="membersBody">
+                <div class="studentTitle">החברים של בית העם</div>
+                <div class="membersBenefits">
+                    <div class="benefit">☕️ כל קפה 10 חינם</div>
+                    <div class="benefit">🥐 30% סוף יום על מאפים וכריכים</div>
+                    <div class="benefit">🎁 50% שובר יום הולדת</div>
+                </div>
+
+                <div class="membersForm" dir="rtl">
+                    <div class="uField">
+                        <input id="mName" class="uInput" type="text" autocomplete="name" placeholder="שם מלא">
+                        <div class="uLine"></div>
+                    </div>
+
+                    <div class="uField">
+                        <input id="mEmail" class="uInput" type="email" autocomplete="email" inputmode="email" placeholder="אימייל">
+                        <div class="uLine"></div>
+                    </div>
+
+                    <div class="membersLabel">יום הולדת</div>
+
+                    <div class="membersRow">
+                        <div class="uField" style="flex:1;">
+                            <select id="mMonth" class="uSelect"></select>
+                            <div class="uLine"></div>
+                        </div>
+                        <div class="uField" style="width:120px;">
+                            <select id="mDay" class="uSelect"></select>
+                            <div class="uLine"></div>
+                        </div>
+                    </div>
+
+                    <button class="membersOpt" id="marketingOptInBtn" type="button" onclick="toggleMarketingOptIn()">
+                        <i id="mOptIcon" class="fa-regular fa-square"></i>
+                        <span>מאשר/ת לקבל עדכונים והטבות מבית העם במייל</span>
+                    </button>
+
+                    <div id="membersErr" class="membersErr hidden"></div>
+                </div>
+            </div>
+
+            <div class="modalBottom studentBottom">
+                <button id="membersJoinBtn" class="studentBtn" type="button" onclick="submitMembersClub()">
+                    הצטרף
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <div id="cashpointShell" class="cashpointShell hidden">
+        <aside id="cashCats" class="cashCats"></aside>
+
+        <main id="cashMenu" class="cashMenu"></main>
+
+        <aside id="cashBasket" class="cashBasket">
+            <div class="cashBasketHeader">
+                <div class="cashBasketTitle">Basket</div>
+                <div class="cashBasketTotal" id="cashBasketTotal">£0.00</div>
+            </div>
+            <div class="cashBasketBody" id="cashBasketBody"></div>
+            <div class="cashBasketBottom" id="cashBasketBottom"></div>
+        </aside>
+    </div>
+
+    <!-- Cashpoint OrderFlow Modal -->
+    <div id="ofHost" class="ofHost hidden" aria-hidden="true">
+        <div class="ofBackdrop" onclick="OF.close()"></div>
+
+        <div class="ofSheetWrap" id="ofSheetWrap">
+            <iframe id="ofFrame" class="ofFrame" src="about:blank" allow="payment *"></iframe>
+        </div>
+    </div>
+    <div class="modal" id="a2hsModal">
+        <div class="backdrop" onclick="closeA2HSHelpSheet()"></div>
+        <div class="cardModal">
+            <div class="sheetTop sheetHeader">
+                <div class="sheetTitle" id="a2hsTitle"></div>
+                <button class="close" onclick="closeA2HSHelpSheet()">✕</button>
+            </div>
+
+            <div class="modalBody" id="a2hsBody"></div>
+        </div>
+    </div>
+
+
+    <script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.js"></script>
+    <script src="MenuApiModel.js?v=24"></script>
+
+    <script src="js/app.js"></script>
 </body>
 </html>
