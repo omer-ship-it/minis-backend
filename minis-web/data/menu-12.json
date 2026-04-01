@@ -1,0 +1,43 @@
+{
+  "customization": {
+    "direction": "ltr",
+    "fontName": "Heebo",
+    "title": "MINIS",
+    "subtitle": "Fresh menu",
+    "service": {
+      "sit": true,
+      "ta": true,
+      "delivery": false
+    }
+  },
+  "items": [
+    {
+      "id": 101,
+      "name": "Espresso",
+      "price": 2.5,
+      "category": "Coffee",
+      "image": "https://images.unsplash.com/photo-1510707577719-ae7c14805e3a?w=600"
+    },
+    {
+      "id": 102,
+      "name": "Cappuccino",
+      "price": 3.2,
+      "category": "Coffee",
+      "image": "https://images.unsplash.com/photo-1509042239860-f550ce710b93?w=600"
+    },
+    {
+      "id": 201,
+      "name": "Croissant",
+      "price": 3.9,
+      "category": "Bakery",
+      "image": "https://images.unsplash.com/photo-1555507036-ab1f4038808a?w=600"
+    },
+    {
+      "id": 202,
+      "name": "Chocolate Cookie",
+      "price": 2.8,
+      "category": "Bakery",
+      "image": "https://images.unsplash.com/photo-1499636136210-6f4ee915583e?w=600"
+    }
+  ]
+}
