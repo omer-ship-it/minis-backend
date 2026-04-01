@@ -9,3 +9,7 @@ Backend service for the minis project.
 - `.github/workflows/` CI/CD workflows
 - `ARCHITECTURE.md` architecture notes
 - `DEPLOYMENT.md` deployment instructions
+
+## CI test
+
+Triggering the PR workflow.
