@@ -1,0 +1,6 @@
+{
+  "name": "Minis Web",
+  "short_name": "Minis",
+  "start_url": "/",
+  "display": "standalone"
+}

@@ -64,3 +64,4 @@
 /Users/minis/Documents/Github/MinisBackend/bin/Debug/net10.0/runtimes/win-arm64/native/Microsoft.Data.SqlClient.SNI.dll
 /Users/minis/Documents/Github/MinisBackend/bin/Debug/net10.0/runtimes/win-x64/native/Microsoft.Data.SqlClient.SNI.dll
 /Users/minis/Documents/Github/MinisBackend/bin/Debug/net10.0/runtimes/win-x86/native/Microsoft.Data.SqlClient.SNI.dll
+/Users/minis/Documents/Github/MinisBackend/bin/Debug/net10.0/minis-web/manifest.json
