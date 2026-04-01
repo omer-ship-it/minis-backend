@@ -4,7 +4,7 @@ builder.Services.AddControllers();
 
 var app = builder.Build();
 
-app.MapGet("/", () => "Minis backend is running");
+app.MapGet("/", () => "Hello World");
 app.MapControllers();
 
 app.Run();

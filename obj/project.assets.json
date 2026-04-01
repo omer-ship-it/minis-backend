@@ -844,7 +844,7 @@
     ]
   },
   "packageFolders": {
-    "/Users/minis/.nuget/packages/": {}
+    "/tmp/.nuget/packages/": {}
   },
   "project": {
     "version": "1.0.0",
@@ -852,11 +852,11 @@
       "projectUniqueName": "/Users/minis/Documents/Github/MinisBackend/MinisBackend.csproj",
       "projectName": "MinisBackend",
       "projectPath": "/Users/minis/Documents/Github/MinisBackend/MinisBackend.csproj",
-      "packagesPath": "/Users/minis/.nuget/packages/",
+      "packagesPath": "/tmp/.nuget/packages/",
       "outputPath": "/Users/minis/Documents/Github/MinisBackend/obj/",
       "projectStyle": "PackageReference",
       "configFilePaths": [
-        "/Users/minis/.nuget/NuGet/NuGet.Config"
+        "/tmp/.nuget/NuGet/NuGet.Config"
       ],
       "originalTargetFrameworks": [
         "net10.0"
@@ -914,7 +914,7 @@
             "privateAssets": "all"
           }
         },
-        "runtimeIdentifierGraphPath": "/usr/local/share/dotnet/sdk/10.0.201/PortableRuntimeIdentifierGraph.json",
+        "runtimeIdentifierGraphPath": "/Users/minis/.dotnet/sdk/10.0.201/PortableRuntimeIdentifierGraph.json",
         "packagesToPrune": {
           "Microsoft.AspNetCore": "(,10.0.32767]",
           "Microsoft.AspNetCore.Antiforgery": "(,10.0.32767]",
