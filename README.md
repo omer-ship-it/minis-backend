@@ -16,3 +16,5 @@ Triggering the PR workflow.
 Trigger main CI
 
 Test branch protection
+
+Auto-merge test
