@@ -14,3 +14,5 @@ Backend service for the minis project.
 
 Triggering the PR workflow.
 Trigger main CI
+
+Test branch protection
