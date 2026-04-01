@@ -12,4 +12,4 @@ Backend service for the minis project.
 
 ## CI test
 
-This is a test change to trigger GitHub Actions.
+Triggering the PR workflow.
