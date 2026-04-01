@@ -12,6 +12,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <Compile Remove="tools/**/*.cs" />
     <Content Remove="minis-web/**" />
     <Content Include="minis-web/**">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
