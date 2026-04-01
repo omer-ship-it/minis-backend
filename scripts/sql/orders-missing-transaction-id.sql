@@ -1,0 +1,4 @@
+SELECT TOP 50 *
+FROM Orders
+WHERE TransactionId IS NULL
+ORDER BY Id DESC;
