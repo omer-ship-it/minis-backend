@@ -1,4 +1,6 @@
+using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.FileProviders;
+using System.Text.Json;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -34,6 +36,51 @@ app.MapGet("/version", () => Results.Ok(new
     deployedAt = DateTime.UtcNow
 }));
 
+app.MapGet("/health/full", async (IConfiguration config) =>
+{
+    var checks = new Dictionary<string, object?>();
+    var ok = true;
+
+    try
+    {
+        var connectionString =
+            config.GetConnectionString("DefaultConnection")
+            ?? Environment.GetEnvironmentVariable("SQL_CONNECTION");
+
+        if (string.IsNullOrWhiteSpace(connectionString))
+        {
+            ok = false;
+            checks["database"] = "missing connection string";
+        }
+        else
+        {
+            await using var connection = new SqlConnection(connectionString);
+            await connection.OpenAsync();
+            await using var command = new SqlCommand("SELECT 1", connection);
+            await command.ExecuteScalarAsync();
+            checks["database"] = "ok";
+        }
+    }
+    catch (Exception ex)
+    {
+        ok = false;
+        checks["database"] = ex.Message;
+    }
+
+    checks["r2Configured"] =
+        !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("CF_R2_ACCOUNT_ID")) &&
+        !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("CF_R2_ACCESS_KEY_ID")) &&
+        !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("CF_R2_BUCKET"));
+
+    return Results.Ok(new
+    {
+        ok,
+        app = "minis-backend",
+        environment = Environment.GetEnvironmentVariable("APP_ENVIRONMENT") ?? "unknown",
+        checks
+    });
+});
+
 app.MapGet("/api/menu/{miniAppId:int}", async (int miniAppId, IHttpClientFactory httpClientFactory, CancellationToken ct) =>
 {
     if (miniAppId <= 0)
@@ -68,6 +115,35 @@ app.MapGet("/api/menu/{miniAppId:int}", async (int miniAppId, IHttpClientFactory
             statusCode: StatusCodes.Status502BadGateway
         );
     }
+});
+
+app.MapGet("/dev/publish-shop-json/{shopId:int}", async (int shopId) =>
+{
+    var uploader = new R2Uploader();
+
+    var payload = new
+    {
+        shopId,
+        updatedAtUtc = DateTime.UtcNow,
+        products = new[]
+        {
+            new { id = 1, name = "Coffee", price = 12 },
+            new { id = 2, name = "Croissant", price = 18 }
+        }
+    };
+
+    var json = JsonSerializer.Serialize(payload, new JsonSerializerOptions
+    {
+        WriteIndented = true
+    });
+
+    await uploader.UploadJsonAsync($"json/{shopId}.json", json);
+
+    return Results.Ok(new
+    {
+        ok = true,
+        key = $"json/{shopId}.json"
+    });
 });
 app.MapControllers();
 
