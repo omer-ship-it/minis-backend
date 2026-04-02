@@ -2164,6 +2164,11 @@
             letter-spacing: 0.2px;
         }
 
+        /* Temporary publish marker: hide member (coffee) icon in header */
+        .headerIcon.left {
+            display: none !important;
+        }
+
         @keyframes bootPulse {
             0% {
                 transform: scale(0.98);
