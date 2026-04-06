@@ -371,8 +371,8 @@
             width: 30px;
             height: 30px;
             border-radius: 50%;
-            background: #fff;
-            color: var(--brand);
+            background: var(--btn);
+            color: var(--btnText, #fff);
             display: flex;
             align-items: center;
             justify-content: center;
