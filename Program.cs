@@ -21,6 +21,9 @@ app.UseStaticFiles(new StaticFileOptions
     FileProvider = minisWebProvider
 });
 
+app.MapGet("/wilde", () => Results.Redirect("/wilde.html"));
+app.MapGet("/demo/wilde", () => Results.Redirect("/wilde.html"));
+
 app.MapGet("/health", () => Results.Ok(new
 {
     ok = true,
