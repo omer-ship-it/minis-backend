@@ -2,56 +2,47 @@ const wildeDestinations = [
     {
         id: "breakfast",
         title: "Breakfast",
-        subtitle: "Morning room service",
-        imageUrl: "https://picsum.photos/seed/wilde-breakfast/800/800"
+        subtitle: "Morning room service"
     },
     {
         id: "minibar",
         title: "Minibar",
-        subtitle: "Snacks and essentials",
-        imageUrl: "https://picsum.photos/seed/wilde-minibar/800/800"
+        subtitle: "Snacks and essentials"
     },
     {
         id: "italian",
         title: "Italian",
-        subtitle: "Pasta and late supper",
-        imageUrl: "https://picsum.photos/seed/wilde-italian/800/800"
+        subtitle: "Pasta and late supper"
     },
     {
         id: "grill",
         title: "Grill",
-        subtitle: "Steaks and burgers",
-        imageUrl: "https://picsum.photos/seed/wilde-grill/800/800"
+        subtitle: "Steaks and burgers"
     },
     {
         id: "asian",
         title: "Asian",
-        subtitle: "Noodles and bao",
-        imageUrl: "https://picsum.photos/seed/wilde-asian/800/800"
+        subtitle: "Noodles and bao"
     },
     {
         id: "bakery",
         title: "Bakery",
-        subtitle: "Pastries and coffee",
-        imageUrl: "https://picsum.photos/seed/wilde-bakery/800/800"
+        subtitle: "Pastries and coffee"
     },
     {
         id: "salads",
         title: "Salads",
-        subtitle: "Fresh bowls",
-        imageUrl: "https://picsum.photos/seed/wilde-salads/800/800"
+        subtitle: "Fresh bowls"
     },
     {
         id: "desserts",
         title: "Desserts",
-        subtitle: "Cakes and sweets",
-        imageUrl: "https://picsum.photos/seed/wilde-desserts/800/800"
+        subtitle: "Cakes and sweets"
     },
     {
         id: "cocktails",
         title: "Cocktails",
-        subtitle: "Bar menu",
-        imageUrl: "https://picsum.photos/seed/wilde-cocktails/800/800"
+        subtitle: "Bar menu"
     }
 ];
 
@@ -84,19 +75,11 @@ function buildTile(destination) {
     const media = document.createElement("div");
     media.className = "wilde-media";
 
-    const image = document.createElement("img");
-    image.alt = "";
-    image.loading = "lazy";
-    image.src = destination.imageUrl;
-    image.addEventListener("error", () => {
-        image.remove();
-    });
-
     const fallback = document.createElement("div");
     fallback.className = "wilde-media-fallback";
-    fallback.textContent = "W";
+    fallback.innerHTML = `<div class="wilde-product-badge">Demo</div>`;
 
-    media.append(image, fallback);
+    media.append(fallback);
 
     const copy = document.createElement("div");
     copy.className = "wilde-copy";
@@ -116,14 +99,6 @@ function buildTile(destination) {
 function buildHero(destination) {
     shopHero.innerHTML = "";
 
-    const image = document.createElement("img");
-    image.alt = "";
-    image.src = destination.imageUrl;
-    image.loading = "eager";
-    image.addEventListener("error", () => {
-        image.remove();
-    });
-
     const copy = document.createElement("div");
     copy.className = "wilde-shop-hero-copy";
     copy.innerHTML = `
@@ -131,7 +106,7 @@ function buildHero(destination) {
         <span>Demo menu presentation for today’s Wilde hotels showcase.</span>
     `;
 
-    shopHero.append(image, copy);
+    shopHero.append(copy);
 }
 
 function buildCategories() {
