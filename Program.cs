@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Text.Json.Nodes;
 using System.Text.Json;
 using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.FileProviders;
@@ -1072,6 +1073,7 @@ ORDER BY Id DESC;
         var submitState = reader.IsDBNull(reader.GetOrdinal("SubmitState")) ? "not_started" : reader.GetString(reader.GetOrdinal("SubmitState"));
         var referenceNumber = reader.IsDBNull(reader.GetOrdinal("ReferenceNumber")) ? null : reader.GetString(reader.GetOrdinal("ReferenceNumber"));
         var transactionId = reader.IsDBNull(reader.GetOrdinal("TransactionId")) ? null : reader.GetString(reader.GetOrdinal("TransactionId"));
+        var metadataJson = reader.GetString(reader.GetOrdinal("MetadataJson"));
         await reader.DisposeAsync();
 
         if (state is "paid" or "declined")
@@ -1101,6 +1103,18 @@ ORDER BY Id DESC;
             ReferenceNumber: referenceNumber,
             TransactionId: transactionId), ct);
 
+        var metadataNode = JsonNode.Parse(metadataJson) as JsonObject ?? new JsonObject();
+        var checkoutNode = metadataNode["checkout"] as JsonObject ?? new JsonObject();
+        metadataNode["checkout"] = checkoutNode;
+        checkoutNode["state"] = gatewayResult.CheckoutState;
+        checkoutNode["submitState"] = submitState;
+        checkoutNode["referenceNumber"] = gatewayResult.ReferenceNumber;
+        checkoutNode["transactionId"] = gatewayResult.TransactionId;
+        checkoutNode["returnCode"] = gatewayResult.ReturnCode;
+        checkoutNode["returnMessage"] = gatewayResult.ReturnMessage;
+        checkoutNode["updatedAtUtc"] = DateTime.UtcNow.ToString("O");
+        var updatedMetadataJson = metadataNode.ToJsonString();
+
         const string updateSql = """
 UPDATE dbo.Orders
 SET
@@ -1108,21 +1122,7 @@ SET
     PaymentMethod = @PaymentMethod,
     PaymentReference = @PaymentReference,
     PaymentApprovedAtUtc = @PaymentApprovedAtUtc,
-    Metadata = JSON_MODIFY(
-        JSON_MODIFY(
-            JSON_MODIFY(
-                JSON_MODIFY(
-                    JSON_MODIFY(
-                        JSON_MODIFY(
-                            JSON_MODIFY(
-                                JSON_MODIFY(CASE WHEN Metadata IS NULL OR ISJSON(Metadata) <> 1 THEN '{}' ELSE Metadata END,
-                                    '$.checkout.state', @CheckoutState),
-                                '$.checkout.submitState', @SubmitState),
-                            '$.checkout.referenceNumber', @PaymentReference),
-                        '$.checkout.transactionId', @TransactionId),
-                        '$.checkout.returnCode', @ReturnCode),
-                    '$.checkout.returnMessage', @ReturnMessage),
-                '$.checkout.updatedAtUtc', @UpdatedAtUtc),
+    Metadata = @Metadata,
     UpdatedAt = SYSUTCDATETIME()
 WHERE Id = @Id;
 """;
@@ -1133,12 +1133,7 @@ WHERE Id = @Id;
         update.Parameters.AddWithValue("@PaymentMethod", gatewayResult.CheckoutState == "paid" ? "card" : "unpaid");
         update.Parameters.AddWithValue("@PaymentReference", (object?)gatewayResult.ReferenceNumber ?? DBNull.Value);
         update.Parameters.AddWithValue("@PaymentApprovedAtUtc", gatewayResult.CheckoutState == "paid" ? DateTime.UtcNow : DBNull.Value);
-        update.Parameters.AddWithValue("@CheckoutState", gatewayResult.CheckoutState);
-        update.Parameters.AddWithValue("@SubmitState", submitState);
-        update.Parameters.AddWithValue("@TransactionId", (object?)gatewayResult.TransactionId ?? DBNull.Value);
-        update.Parameters.AddWithValue("@ReturnCode", (object?)gatewayResult.ReturnCode ?? DBNull.Value);
-        update.Parameters.AddWithValue("@ReturnMessage", (object?)gatewayResult.ReturnMessage ?? DBNull.Value);
-        update.Parameters.AddWithValue("@UpdatedAtUtc", DateTime.UtcNow.ToString("O"));
+        update.Parameters.AddWithValue("@Metadata", updatedMetadataJson);
         await update.ExecuteNonQueryAsync(ct);
 
         return gatewayResult.CheckoutState switch
