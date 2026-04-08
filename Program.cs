@@ -199,6 +199,7 @@ app.MapGet("/dev/publish-shop-json/{shopId:int}", async (int shopId) =>
 app.MapPost("/checkout/zcredit/card", async (
     CheckoutZcreditCardRequest req,
     IConfiguration config,
+    IHttpClientFactory httpFactory,
     HttpContext ctx,
     ILogger<Program> log,
     CancellationToken ct) =>
@@ -214,6 +215,17 @@ app.MapPost("/checkout/zcredit/card", async (
     {
         var value = string.IsNullOrWhiteSpace(raw) ? "mini" : raw.Trim();
         return value.Length <= 20 ? value : value[..20];
+    }
+
+    static string ResolveSubmitMode(IConfiguration cfg, IHostEnvironment env)
+    {
+        var configured = (cfg["CheckoutDebug:SubmitMode"] ?? "").Trim().ToLowerInvariant();
+        if (configured is "off" or "fake" or "real")
+        {
+            return configured;
+        }
+
+        return env.IsDevelopment() ? "fake" : "real";
     }
 
     static string? ResolveWriteConnectionString(IConfiguration cfg) =>
@@ -346,7 +358,12 @@ ORDER BY Id DESC;
         string? referenceNumber,
         string? transactionId,
         string? returnCode,
-        string? returnMessage)
+        string? returnMessage,
+        int? submittedOrderId = null,
+        bool? submitReplay = null,
+        int? submitHttpStatus = null,
+        string? submitError = null,
+        DateTime? submitAttemptedAtUtc = null)
     {
         var now = DateTime.UtcNow;
         var metadata = new
@@ -371,6 +388,15 @@ ORDER BY Id DESC;
                 returnCode,
                 returnMessage,
                 updatedAtUtc = now
+            },
+            submit = new
+            {
+                state = submitState,
+                orderId = submittedOrderId,
+                replay = submitReplay,
+                httpStatus = submitHttpStatus,
+                error = submitError,
+                attemptedAtUtc = submitAttemptedAtUtc
             },
             order = order,
             basketCount = order.Basket?.Count ?? 0
@@ -469,6 +495,11 @@ SELECT CAST(SCOPE_IDENTITY() AS int);
         string? transactionId,
         string? returnCode,
         string? returnMessage,
+        int? submittedOrderId,
+        bool? submitReplay,
+        int? submitHttpStatus,
+        string? submitError,
+        DateTime? submitAttemptedAtUtc,
         CancellationToken token)
     {
         var orderSource = string.IsNullOrWhiteSpace(order.Source) ? "mini-zcredit-card-debug" : order.Source.Trim();
@@ -486,7 +517,12 @@ SELECT CAST(SCOPE_IDENTITY() AS int);
             referenceNumber,
             transactionId,
             returnCode,
-            returnMessage);
+            returnMessage,
+            submittedOrderId,
+            submitReplay,
+            submitHttpStatus,
+            submitError,
+            submitAttemptedAtUtc);
 
         const string sql = """
 UPDATE dbo.Orders
@@ -553,6 +589,7 @@ WHERE Id = @Id;
     var currency = string.IsNullOrWhiteSpace(req.Currency) ? "ILS" : req.Currency.Trim().ToUpperInvariant();
     var transactionType = string.IsNullOrWhiteSpace(req.TransactionType) ? "01" : req.TransactionType.Trim();
     var allowMemoryFallback = AllowMemoryFallback(config, app.Environment);
+    var submitMode = ResolveSubmitMode(config, app.Environment);
     var normalizedOrder = req.Order with { Source = NormalizeSource(req.Order.Source) };
     var gateway = ZcreditGatewayFactory.Create(config, log);
 
@@ -636,7 +673,7 @@ WHERE Id = @Id;
             UpdatedAtUtc = DateTime.UtcNow,
             Checkout = new MemoryCheckoutState(
                 gatewayResult.CheckoutState,
-                "not_started",
+                gatewayResult.CheckoutState == "paid" && submitMode != "off" ? "done" : "not_started",
                 gatewayResult.ReferenceNumber,
                 gatewayResult.TransactionId,
                 gatewayResult.ReturnCode,
@@ -670,6 +707,55 @@ WHERE Id = @Id;
         var existing = await FindExistingAsync(conn, miniAppId, idempotencyKey, ct);
         if (existing is not null)
         {
+            if (existing.Checkout.State == "paid" && existing.Checkout.SubmitState != "done" && submitMode != "off")
+            {
+                var submitResult = await SubmitOrderHelper.SubmitAsync(
+                    httpFactory,
+                    config,
+                    log,
+                    app.Environment,
+                    normalizedOrder,
+                    miniAppId,
+                    existing.OrderId,
+                    amount,
+                    currency,
+                    idempotencyKey,
+                    req.PinpadId,
+                    transactionType,
+                    new GatewayResult(
+                        existing.Checkout.State,
+                        existing.Checkout.ReferenceNumber,
+                        existing.Checkout.TransactionId,
+                        existing.Checkout.ReturnCode,
+                        existing.Checkout.ReturnMessage),
+                    ct);
+
+                await UpdateOrderAsync(
+                    conn,
+                    existing.OrderId,
+                    req,
+                    normalizedOrder,
+                    miniAppId,
+                    idempotencyKey,
+                    amount,
+                    currency,
+                    transactionType,
+                    existing.Checkout.State,
+                    submitResult.SubmitState,
+                    existing.Checkout.ReferenceNumber,
+                    existing.Checkout.TransactionId,
+                    existing.Checkout.ReturnCode,
+                    existing.Checkout.ReturnMessage,
+                    submitResult.SubmittedOrderId,
+                    submitResult.Replay,
+                    submitResult.HttpStatus,
+                    submitResult.Error,
+                    submitResult.AttemptedAtUtc,
+                    ct);
+
+                existing = await FindExistingAsync(conn, miniAppId, idempotencyKey, ct) ?? existing;
+            }
+
             log.LogWarning(
                 "Replay checkout request miniAppId={MiniAppId} idem={Idem} orderId={OrderId} state={State} trace={Trace}",
                 miniAppId, idempotencyKey, existing.OrderId, existing.Checkout.State, traceId);
@@ -732,7 +818,54 @@ WHERE Id = @Id;
             gatewayResult.TransactionId,
             gatewayResult.ReturnCode,
             gatewayResult.ReturnMessage,
+            null,
+            null,
+            null,
+            null,
+            null,
             ct);
+
+        if (gatewayResult.CheckoutState == "paid")
+        {
+            var submitResult = await SubmitOrderHelper.SubmitAsync(
+                httpFactory,
+                config,
+                log,
+                app.Environment,
+                normalizedOrder,
+                miniAppId,
+                orderId,
+                amount,
+                currency,
+                idempotencyKey,
+                req.PinpadId,
+                transactionType,
+                gatewayResult,
+                ct);
+
+            await UpdateOrderAsync(
+                conn,
+                orderId,
+                req,
+                normalizedOrder,
+                miniAppId,
+                idempotencyKey,
+                amount,
+                currency,
+                transactionType,
+                gatewayResult.CheckoutState,
+                submitResult.SubmitState,
+                gatewayResult.ReferenceNumber,
+                gatewayResult.TransactionId,
+                gatewayResult.ReturnCode,
+                gatewayResult.ReturnMessage,
+                submitResult.SubmittedOrderId,
+                submitResult.Replay,
+                submitResult.HttpStatus,
+                submitResult.Error,
+                submitResult.AttemptedAtUtc,
+                ct);
+        }
 
         var finalOrder = await FindExistingAsync(conn, miniAppId, idempotencyKey, ct)
             ?? throw new InvalidOperationException($"Order {orderId} was updated but could not be reloaded.");
@@ -775,6 +908,7 @@ WHERE Id = @Id;
 app.MapPost("/checkout/zcredit/card/reconcile", async (
     CheckoutReconcileRequest req,
     IConfiguration config,
+    IHttpClientFactory httpFactory,
     HttpContext ctx,
     ILogger<Program> log,
     CancellationToken ct) =>
@@ -871,6 +1005,9 @@ app.MapPost("/checkout/zcredit/card/reconcile", async (
                 Checkout = memoryOrder.Checkout with
                 {
                     State = gatewayResult.CheckoutState,
+                    SubmitState = gatewayResult.CheckoutState == "paid" && SubmitOrderHelper.ResolveMode(config, app.Environment) != "off"
+                        ? "done"
+                        : memoryOrder.Checkout.SubmitState,
                     ReferenceNumber = gatewayResult.ReferenceNumber ?? memoryOrder.Checkout.ReferenceNumber,
                     TransactionId = gatewayResult.TransactionId ?? memoryOrder.Checkout.TransactionId,
                     ReturnCode = gatewayResult.ReturnCode,
@@ -970,6 +1107,9 @@ app.MapPost("/checkout/zcredit/card/reconcile", async (
                 Checkout = memoryOrder.Checkout with
                 {
                     State = gatewayResult.CheckoutState,
+                    SubmitState = gatewayResult.CheckoutState == "paid" && SubmitOrderHelper.ResolveMode(config, app.Environment) != "off"
+                        ? "done"
+                        : memoryOrder.Checkout.SubmitState,
                     ReferenceNumber = gatewayResult.ReferenceNumber ?? memoryOrder.Checkout.ReferenceNumber,
                     TransactionId = gatewayResult.TransactionId ?? memoryOrder.Checkout.TransactionId,
                     ReturnCode = gatewayResult.ReturnCode,
@@ -1076,6 +1216,46 @@ ORDER BY Id DESC;
         var metadataJson = reader.GetString(reader.GetOrdinal("MetadataJson"));
         await reader.DisposeAsync();
 
+        if (state == "paid" && submitState != "done" && SubmitOrderHelper.ResolveMode(config, app.Environment) != "off")
+        {
+            var extractedOrder = SubmitOrderHelper.TryExtractOrder(metadataJson);
+            var submitResult = extractedOrder is null
+                ? new SubmitOrderAttemptResult("failed", null, null, null, "Could not extract order payload from checkout metadata", DateTime.UtcNow)
+                : await SubmitOrderHelper.SubmitAsync(
+                    httpFactory,
+                    config,
+                    log,
+                    app.Environment,
+                    extractedOrder,
+                    req.MiniAppId,
+                    orderId,
+                    amount,
+                    "ILS",
+                    idempotencyKey,
+                    null,
+                    "01",
+                    new GatewayResult(state, referenceNumber, transactionId, null, null),
+                    ct);
+
+            var existingMetadataNode = JsonNode.Parse(metadataJson) as JsonObject ?? new JsonObject();
+            SubmitOrderHelper.ApplySubmitResult(existingMetadataNode, submitResult);
+            var replayMetadataJson = existingMetadataNode.ToJsonString();
+
+            const string replaySubmitSql = """
+UPDATE dbo.Orders
+SET
+    Metadata = @Metadata,
+    UpdatedAt = SYSUTCDATETIME()
+WHERE Id = @Id;
+""";
+
+            await using var replaySubmitUpdate = new SqlCommand(replaySubmitSql, conn);
+            replaySubmitUpdate.Parameters.AddWithValue("@Id", orderId);
+            replaySubmitUpdate.Parameters.AddWithValue("@Metadata", replayMetadataJson);
+            await replaySubmitUpdate.ExecuteNonQueryAsync(ct);
+            submitState = submitResult.SubmitState;
+        }
+
         if (state is "paid" or "declined")
         {
             return Results.Ok(new
@@ -1136,6 +1316,41 @@ WHERE Id = @Id;
         update.Parameters.AddWithValue("@Metadata", updatedMetadataJson);
         await update.ExecuteNonQueryAsync(ct);
 
+        var finalSubmitState = submitState;
+        if (gatewayResult.CheckoutState == "paid")
+        {
+            var extractedOrder = SubmitOrderHelper.TryExtractOrder(metadataJson);
+            var submitResult = extractedOrder is null
+                ? new SubmitOrderAttemptResult("failed", null, null, null, "Could not extract order payload from checkout metadata", DateTime.UtcNow)
+                : await SubmitOrderHelper.SubmitAsync(
+                    httpFactory,
+                    config,
+                    log,
+                    app.Environment,
+                    extractedOrder,
+                    req.MiniAppId,
+                    orderId,
+                    amount,
+                    "ILS",
+                    idempotencyKey,
+                    null,
+                    "01",
+                    gatewayResult,
+                    ct);
+
+            finalSubmitState = submitResult.SubmitState;
+            SubmitOrderHelper.ApplySubmitResult(metadataNode, submitResult);
+
+            await using var submitUpdate = new SqlCommand(updateSql, conn);
+            submitUpdate.Parameters.AddWithValue("@Id", orderId);
+            submitUpdate.Parameters.AddWithValue("@Status", gatewayResult.CheckoutState == "paid" ? 1 : 0);
+            submitUpdate.Parameters.AddWithValue("@PaymentMethod", gatewayResult.CheckoutState == "paid" ? "card" : "unpaid");
+            submitUpdate.Parameters.AddWithValue("@PaymentReference", (object?)gatewayResult.ReferenceNumber ?? DBNull.Value);
+            submitUpdate.Parameters.AddWithValue("@PaymentApprovedAtUtc", gatewayResult.CheckoutState == "paid" ? DateTime.UtcNow : DBNull.Value);
+            submitUpdate.Parameters.AddWithValue("@Metadata", metadataNode.ToJsonString());
+            await submitUpdate.ExecuteNonQueryAsync(ct);
+        }
+
         return gatewayResult.CheckoutState switch
         {
             "paid" => Results.Ok(new
@@ -1145,7 +1360,7 @@ WHERE Id = @Id;
                 orderId,
                 payment = gatewayResult.CheckoutState,
                 checkoutState = gatewayResult.CheckoutState,
-                submitState,
+                submitState = finalSubmitState,
                 gatewayResult.ReferenceNumber,
                 gatewayResult.TransactionId,
                 traceId = ctx.TraceIdentifier,
@@ -1158,7 +1373,7 @@ WHERE Id = @Id;
                 orderId,
                 payment = gatewayResult.CheckoutState,
                 checkoutState = gatewayResult.CheckoutState,
-                submitState,
+                submitState = finalSubmitState,
                 gatewayResult.ReferenceNumber,
                 gatewayResult.TransactionId,
                 traceId = ctx.TraceIdentifier,
@@ -1171,7 +1386,7 @@ WHERE Id = @Id;
                 orderId,
                 payment = gatewayResult.CheckoutState,
                 checkoutState = gatewayResult.CheckoutState,
-                submitState,
+                submitState = finalSubmitState,
                 gatewayResult.ReferenceNumber,
                 gatewayResult.TransactionId,
                 traceId = ctx.TraceIdentifier,
@@ -1353,7 +1568,17 @@ internal record CheckoutOrderPayload(
     string? Name,
     string? Source,
     List<CheckoutBasketItem>? Basket,
-    string? IdempotencyKey);
+    string? IdempotencyKey,
+    string? DiningMode = null,
+    string? Service = null,
+    JsonElement? Totals = null,
+    JsonElement? Device = null,
+    JsonElement? Notifications = null,
+    JsonElement? Delivery = null,
+    JsonElement? Payment = null,
+    int? TicketNumber = null,
+    string? OrderType = null,
+    string? TabKey = null);
 
 internal record CheckoutBasketItem(
     int? ProductId,
@@ -1426,10 +1651,294 @@ internal record GatewayResult(
     string? ReturnCode,
     string? ReturnMessage);
 
+internal record SubmitOrderAttemptResult(
+    string SubmitState,
+    int? SubmittedOrderId,
+    bool? Replay,
+    int? HttpStatus,
+    string? Error,
+    DateTime AttemptedAtUtc);
+
 internal interface IZcreditGateway
 {
     Task<GatewayResult> CommitAsync(GatewayCommitRequest request, CancellationToken ct);
     Task<GatewayResult> ReconcileAsync(GatewayReconcileRequest request, CancellationToken ct);
+}
+
+internal static class SubmitOrderHelper
+{
+    public static string ResolveMode(IConfiguration config, IHostEnvironment env)
+    {
+        var configured = (config["CheckoutDebug:SubmitMode"] ?? "").Trim().ToLowerInvariant();
+        if (configured is "off" or "fake" or "real")
+        {
+            return configured;
+        }
+
+        return env.IsDevelopment() ? "fake" : "real";
+    }
+
+    public static CheckoutOrderPayload? TryExtractOrder(string metadataJson)
+    {
+        try
+        {
+            var root = JsonNode.Parse(metadataJson) as JsonObject;
+            var orderNode = root?["order"];
+            return orderNode is null
+                ? null
+                : JsonSerializer.Deserialize<CheckoutOrderPayload>(orderNode.ToJsonString());
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    public static void ApplySubmitResult(JsonObject metadataNode, SubmitOrderAttemptResult result)
+    {
+        var checkoutNode = metadataNode["checkout"] as JsonObject ?? new JsonObject();
+        metadataNode["checkout"] = checkoutNode;
+        checkoutNode["submitState"] = result.SubmitState;
+
+        var submitNode = metadataNode["submit"] as JsonObject ?? new JsonObject();
+        metadataNode["submit"] = submitNode;
+        submitNode["state"] = result.SubmitState;
+        submitNode["orderId"] = result.SubmittedOrderId;
+        submitNode["replay"] = result.Replay;
+        submitNode["httpStatus"] = result.HttpStatus;
+        submitNode["error"] = result.Error;
+        submitNode["attemptedAtUtc"] = result.AttemptedAtUtc.ToString("O");
+    }
+
+    public static async Task<SubmitOrderAttemptResult> SubmitAsync(
+        IHttpClientFactory httpFactory,
+        IConfiguration config,
+        ILogger log,
+        IHostEnvironment env,
+        CheckoutOrderPayload order,
+        int miniAppId,
+        int checkoutOrderId,
+        decimal amount,
+        string currency,
+        string idempotencyKey,
+        string? pinpadId,
+        string transactionType,
+        GatewayResult gatewayResult,
+        CancellationToken ct)
+    {
+        var mode = ResolveMode(config, env);
+        var attemptedAtUtc = DateTime.UtcNow;
+
+        if (mode == "off")
+        {
+            return new SubmitOrderAttemptResult("not_started", null, null, null, null, attemptedAtUtc);
+        }
+
+        if (mode == "fake")
+        {
+            log.LogInformation(
+                "Fake submitOrder miniAppId={MiniAppId} checkoutOrderId={CheckoutOrderId} idem={Idem}",
+                miniAppId, checkoutOrderId, idempotencyKey);
+            return new SubmitOrderAttemptResult("done", checkoutOrderId + 500000, false, 200, null, attemptedAtUtc);
+        }
+
+        var url = (config["CheckoutDebug:SubmitOrderUrl"] ?? "https://minis.studio/submitOrder").Trim();
+        if (string.IsNullOrWhiteSpace(url))
+        {
+            return new SubmitOrderAttemptResult("failed", null, null, null, "Missing CheckoutDebug:SubmitOrderUrl", attemptedAtUtc);
+        }
+
+        var payload = BuildSubmitPayload(order, miniAppId, amount, currency, idempotencyKey, pinpadId, transactionType, gatewayResult);
+        using var req = new HttpRequestMessage(HttpMethod.Post, url)
+        {
+            Content = new StringContent(payload.ToJsonString(), System.Text.Encoding.UTF8, "application/json")
+        };
+        var source = NormalizeSource(order.Source);
+        req.Headers.TryAddWithoutValidation("Idempotency-Key", idempotencyKey);
+        req.Headers.TryAddWithoutValidation("X-Request-Id", idempotencyKey);
+        req.Headers.TryAddWithoutValidation("X-Order-Source", source);
+
+        try
+        {
+            var client = httpFactory.CreateClient();
+            client.Timeout = TimeSpan.FromSeconds(30);
+            using var response = await client.SendAsync(req, ct);
+            var body = await response.Content.ReadAsStringAsync(ct);
+
+            if (!response.IsSuccessStatusCode)
+            {
+                log.LogWarning(
+                    "submitOrder failed miniAppId={MiniAppId} checkoutOrderId={CheckoutOrderId} status={Status}",
+                    miniAppId, checkoutOrderId, (int)response.StatusCode);
+                return new SubmitOrderAttemptResult("failed", null, null, (int)response.StatusCode, body, attemptedAtUtc);
+            }
+
+            int? submittedOrderId = null;
+            bool? replay = null;
+            try
+            {
+                using var doc = JsonDocument.Parse(body);
+                var root = doc.RootElement;
+                if (root.TryGetProperty("orderId", out var orderIdProp) && orderIdProp.TryGetInt32(out var parsedOrderId))
+                {
+                    submittedOrderId = parsedOrderId;
+                }
+
+                if (root.TryGetProperty("replay", out var replayProp) &&
+                    (replayProp.ValueKind == JsonValueKind.True || replayProp.ValueKind == JsonValueKind.False))
+                {
+                    replay = replayProp.GetBoolean();
+                }
+            }
+            catch
+            {
+            }
+
+            return submittedOrderId.HasValue && submittedOrderId.Value > 0
+                ? new SubmitOrderAttemptResult("done", submittedOrderId, replay, (int)response.StatusCode, null, attemptedAtUtc)
+                : new SubmitOrderAttemptResult("failed", null, replay, (int)response.StatusCode, "submitOrder succeeded but returned no orderId", attemptedAtUtc);
+        }
+        catch (Exception ex)
+        {
+            log.LogError(ex,
+                "submitOrder exception miniAppId={MiniAppId} checkoutOrderId={CheckoutOrderId}",
+                miniAppId, checkoutOrderId);
+            return new SubmitOrderAttemptResult("failed", null, null, null, ex.Message, attemptedAtUtc);
+        }
+    }
+
+    private static JsonObject BuildSubmitPayload(
+        CheckoutOrderPayload order,
+        int miniAppId,
+        decimal amount,
+        string currency,
+        string idempotencyKey,
+        string? pinpadId,
+        string transactionType,
+        GatewayResult gatewayResult)
+    {
+        var source = NormalizeSource(order.Source);
+        var payload = new JsonObject
+        {
+            ["uuid"] = string.IsNullOrWhiteSpace(order.UUID) ? Guid.NewGuid().ToString() : order.UUID,
+            ["email"] = string.IsNullOrWhiteSpace(order.Email) ? "customer@example.com" : order.Email,
+            ["name"] = string.IsNullOrWhiteSpace(order.Name) ? "Customer" : order.Name,
+            ["miniAppId"] = miniAppId,
+            ["total"] = amount,
+            ["source"] = source,
+            ["orderSource"] = source,
+            ["idempotencyKey"] = idempotencyKey,
+            ["basket"] = BuildBasket(order.Basket),
+            ["service"] = string.IsNullOrWhiteSpace(order.Service) ? InferService(order.DiningMode) : order.Service,
+            ["totals"] = CloneNode(order.Totals) ?? new JsonObject
+            {
+                ["total"] = amount,
+                ["subtotal"] = amount,
+                ["discount"] = 0,
+                ["currency"] = currency
+            },
+            ["payment"] = CloneNode(order.Payment) ?? new JsonObject
+            {
+                ["provider"] = "zcredit",
+                ["method"] = "card",
+                ["cardAmount"] = amount,
+                ["cashAmount"] = 0
+            },
+            ["zcredit"] = new JsonObject
+            {
+                ["provider"] = "zcredit",
+                ["method"] = "card",
+                ["referenceNumber"] = gatewayResult.ReferenceNumber,
+                ["transactionId"] = gatewayResult.TransactionId,
+                ["returnCode"] = gatewayResult.ReturnCode,
+                ["returnMessage"] = gatewayResult.ReturnMessage,
+                ["pinpadId"] = pinpadId,
+                ["transactionType"] = transactionType
+            }
+        };
+
+        if (!string.IsNullOrWhiteSpace(order.DiningMode))
+        {
+            payload["diningMode"] = order.DiningMode;
+        }
+
+        if (CloneNode(order.Device) is JsonNode deviceNode)
+        {
+            payload["device"] = deviceNode;
+        }
+
+        if (CloneNode(order.Notifications) is JsonNode notificationsNode)
+        {
+            payload["notifications"] = notificationsNode;
+        }
+
+        if (CloneNode(order.Delivery) is JsonNode deliveryNode)
+        {
+            payload["delivery"] = deliveryNode;
+        }
+
+        if (order.TicketNumber.HasValue)
+        {
+            payload["ticketNumber"] = order.TicketNumber.Value;
+        }
+
+        if (!string.IsNullOrWhiteSpace(order.OrderType))
+        {
+            payload["orderType"] = order.OrderType;
+        }
+
+        if (!string.IsNullOrWhiteSpace(order.TabKey))
+        {
+            payload["tabKey"] = order.TabKey;
+        }
+
+        return payload;
+    }
+
+    private static JsonArray BuildBasket(List<CheckoutBasketItem>? basket)
+    {
+        var arr = new JsonArray();
+        if (basket is null)
+        {
+            return arr;
+        }
+
+        for (var i = 0; i < basket.Count; i++)
+        {
+            var item = basket[i];
+            var quantity = Math.Max(item.Quantity, 0);
+            arr.Add(new JsonObject
+            {
+                ["lineId"] = i + 1,
+                ["productId"] = item.ProductId,
+                ["name"] = item.Name,
+                ["quantity"] = quantity,
+                ["unitPrice"] = item.Price,
+                ["lineTotal"] = item.Price * quantity,
+                ["modifiers"] = item.Modifiers ?? "",
+                ["isOth"] = false
+            });
+        }
+
+        return arr;
+    }
+
+    private static JsonNode? CloneNode(JsonElement? value) =>
+        !value.HasValue || value.Value.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined
+            ? null
+            : JsonNode.Parse(value.Value.GetRawText());
+
+    private static string NormalizeSource(string? raw)
+    {
+        var value = string.IsNullOrWhiteSpace(raw) ? "mini" : raw.Trim();
+        return value.Length <= 20 ? value : value[..20];
+    }
+
+    private static string InferService(string? diningMode)
+    {
+        var normalized = (diningMode ?? "").Trim().ToLowerInvariant();
+        return normalized is "takeaway" or "ta" ? "ta" : "sit";
+    }
 }
 
 internal static class ZcreditGatewayFactory
