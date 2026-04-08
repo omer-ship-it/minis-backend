@@ -728,6 +728,7 @@ WHERE Id = @Id;
                         existing.Checkout.TransactionId,
                         existing.Checkout.ReturnCode,
                         existing.Checkout.ReturnMessage),
+                    SubmitOrderHelper.TryExtractSubmittedOrderId(existing.MetadataJson),
                     ct);
 
                 await UpdateOrderAsync(
@@ -841,6 +842,7 @@ WHERE Id = @Id;
                 req.PinpadId,
                 transactionType,
                 gatewayResult,
+                null,
                 ct);
 
             await UpdateOrderAsync(
@@ -1235,6 +1237,7 @@ ORDER BY Id DESC;
                     null,
                     "01",
                     new GatewayResult(state, referenceNumber, transactionId, null, null),
+                    SubmitOrderHelper.TryExtractSubmittedOrderId(metadataJson),
                     ct);
 
             var existingMetadataNode = JsonNode.Parse(metadataJson) as JsonObject ?? new JsonObject();
@@ -1336,6 +1339,7 @@ WHERE Id = @Id;
                     null,
                     "01",
                     gatewayResult,
+                    SubmitOrderHelper.TryExtractSubmittedOrderId(metadataJson),
                     ct);
 
             finalSubmitState = submitResult.SubmitState;
@@ -1930,6 +1934,7 @@ WHERE Id = @Id;
                                 existing.Checkout.TransactionId,
                                 existing.Checkout.ReturnCode,
                                 existing.Checkout.ReturnMessage),
+                            SubmitOrderHelper.TryExtractSubmittedOrderId(existing.MetadataJson),
                             ct);
 
                         await UpdateOrderAsync(
@@ -1987,6 +1992,7 @@ WHERE Id = @Id;
                         null,
                         "",
                         new GatewayResult(checkoutState, null, null, null, paymentMode == "cash" ? "Cash accepted" : "Pay later accepted"),
+                        null,
                         ct);
 
                     submitState = submitResult.SubmitState;
@@ -2039,6 +2045,312 @@ WHERE Id = @Id;
     catch (Exception ex)
     {
         log.LogError(ex, "Offline checkout endpoint failed trace={Trace}", ctx.TraceIdentifier);
+        return Results.Json(new
+        {
+            ok = false,
+            error = ex.Message,
+            type = ex.GetType().FullName,
+            traceId = ctx.TraceIdentifier
+        }, statusCode: 500);
+    }
+});
+
+app.MapPost("/checkout/offline/settle", async (
+    CheckoutOfflineSettleRequest req,
+    IConfiguration config,
+    IHttpClientFactory httpFactory,
+    HttpContext ctx,
+    ILogger<Program> log,
+    CancellationToken ct) =>
+{
+    try
+    {
+        static string NormalizeSource(string? raw) => "cashpoint";
+
+        static string NormalizeIdempotency(string? raw, int checkoutOrderId) =>
+            string.IsNullOrWhiteSpace(raw) ? $"settle-cash-{checkoutOrderId}" : raw.Trim();
+
+        static string ResolveSubmitMode(IConfiguration cfg, IHostEnvironment env)
+        {
+            var configured = (cfg["CheckoutDebug:SubmitMode"] ?? "").Trim().ToLowerInvariant();
+            if (configured is "off" or "fake" or "real")
+            {
+                return configured;
+            }
+
+            return env.IsDevelopment() ? "fake" : "real";
+        }
+
+        static string? ResolveWriteConnectionString(IConfiguration cfg) =>
+            cfg.GetConnectionString("DefaultConnection")
+            ?? Environment.GetEnvironmentVariable("SQL_CONNECTION");
+
+        static async Task<SqlConnection> OpenConnectionAsync(IConfiguration cfg, CancellationToken token)
+        {
+            var connectionString = ResolveWriteConnectionString(cfg);
+            if (string.IsNullOrWhiteSpace(connectionString))
+            {
+                throw new InvalidOperationException("Missing write connection string. Set ConnectionStrings:DefaultConnection or SQL_CONNECTION.");
+            }
+
+            var connection = new SqlConnection(connectionString);
+            await connection.OpenAsync(token);
+            return connection;
+        }
+
+        static string NormalizePaymentMode(string? raw)
+        {
+            var value = (raw ?? "").Trim().ToLowerInvariant();
+            return value switch
+            {
+                "cash" => "cash",
+                _ => ""
+            };
+        }
+
+        static JsonElement BuildOfflinePaymentElement(decimal amount)
+        {
+            return JsonSerializer.SerializeToElement(new
+            {
+                provider = "minis",
+                method = "cash",
+                cardAmount = 0m,
+                cashAmount = amount
+            });
+        }
+
+        static string ResolveCurrency(CheckoutOrderPayload order, string? preferred)
+        {
+            if (!string.IsNullOrWhiteSpace(preferred))
+            {
+                return preferred.Trim().ToUpperInvariant();
+            }
+
+            if (order.Totals.HasValue &&
+                order.Totals.Value.ValueKind == JsonValueKind.Object &&
+                order.Totals.Value.TryGetProperty("currency", out var currencyProp) &&
+                currencyProp.ValueKind == JsonValueKind.String &&
+                !string.IsNullOrWhiteSpace(currencyProp.GetString()))
+            {
+                return currencyProp.GetString()!.Trim().ToUpperInvariant();
+            }
+
+            return "ILS";
+        }
+
+        static CheckoutOrderPayload MergeOrder(CheckoutOrderPayload existing, CheckoutOrderPayload? incoming, decimal amount)
+        {
+            var merged = incoming is null
+                ? existing
+                : existing with
+                {
+                    MiniAppId = incoming.MiniAppId > 0 ? incoming.MiniAppId : existing.MiniAppId,
+                    CustomerId = incoming.CustomerId ?? existing.CustomerId,
+                    UUID = string.IsNullOrWhiteSpace(incoming.UUID) ? existing.UUID : incoming.UUID,
+                    Email = string.IsNullOrWhiteSpace(incoming.Email) ? existing.Email : incoming.Email,
+                    Name = string.IsNullOrWhiteSpace(incoming.Name) ? existing.Name : incoming.Name,
+                    Source = string.IsNullOrWhiteSpace(incoming.Source) ? existing.Source : incoming.Source,
+                    Basket = incoming.Basket is { Count: > 0 } ? incoming.Basket : existing.Basket,
+                    IdempotencyKey = string.IsNullOrWhiteSpace(incoming.IdempotencyKey) ? existing.IdempotencyKey : incoming.IdempotencyKey,
+                    DiningMode = string.IsNullOrWhiteSpace(incoming.DiningMode) ? existing.DiningMode : incoming.DiningMode,
+                    Service = string.IsNullOrWhiteSpace(incoming.Service) ? existing.Service : incoming.Service,
+                    Totals = incoming.Totals ?? existing.Totals,
+                    Device = incoming.Device ?? existing.Device,
+                    Notifications = incoming.Notifications ?? existing.Notifications,
+                    Delivery = incoming.Delivery ?? existing.Delivery,
+                    TicketNumber = incoming.TicketNumber ?? existing.TicketNumber,
+                    OrderType = string.IsNullOrWhiteSpace(incoming.OrderType) ? existing.OrderType : incoming.OrderType,
+                    TabKey = string.IsNullOrWhiteSpace(incoming.TabKey) ? existing.TabKey : incoming.TabKey
+                };
+
+            return merged with
+            {
+                Source = NormalizeSource(merged.Source),
+                Payment = BuildOfflinePaymentElement(amount)
+            };
+        }
+
+        static async Task<DbCheckoutOrder?> FindByOrderIdAsync(SqlConnection conn, int checkoutOrderId, int? miniAppId, CancellationToken token)
+        {
+            const string sql = """
+SELECT TOP (1)
+    Id,
+    MiniAppId,
+    Total,
+    Status,
+    ISNULL(PaymentMethod, 'unpaid') AS PaymentMethod,
+    CreatedAt,
+    UpdatedAt,
+    ISNULL(CAST(Metadata AS nvarchar(max)), '{}') AS MetadataJson,
+    JSON_VALUE(Metadata, '$.checkout.state') AS CheckoutState,
+    JSON_VALUE(Metadata, '$.checkout.submitState') AS SubmitState,
+    JSON_VALUE(Metadata, '$.checkout.referenceNumber') AS ReferenceNumber,
+    JSON_VALUE(Metadata, '$.checkout.transactionId') AS TransactionId,
+    JSON_VALUE(Metadata, '$.checkout.returnCode') AS ReturnCode,
+    JSON_VALUE(Metadata, '$.checkout.returnMessage') AS ReturnMessage
+FROM dbo.Orders
+WHERE Id = @Id
+  AND (@MiniAppId IS NULL OR MiniAppId = @MiniAppId);
+""";
+
+            await using var cmd = new SqlCommand(sql, conn);
+            cmd.Parameters.AddWithValue("@Id", checkoutOrderId);
+            cmd.Parameters.AddWithValue("@MiniAppId", (object?)miniAppId ?? DBNull.Value);
+
+            await using var reader = await cmd.ExecuteReaderAsync(token);
+            if (!await reader.ReadAsync(token))
+            {
+                return null;
+            }
+
+            return new DbCheckoutOrder(
+                OrderId: reader.GetInt32(reader.GetOrdinal("Id")),
+                MiniAppId: reader.GetInt32(reader.GetOrdinal("MiniAppId")),
+                Amount: reader.GetDecimal(reader.GetOrdinal("Total")),
+                Status: reader.GetInt32(reader.GetOrdinal("Status")),
+                PaymentMethod: reader.GetString(reader.GetOrdinal("PaymentMethod")),
+                CreatedAtUtc: reader.GetDateTime(reader.GetOrdinal("CreatedAt")),
+                UpdatedAtUtc: reader.GetDateTime(reader.GetOrdinal("UpdatedAt")),
+                MetadataJson: reader.GetString(reader.GetOrdinal("MetadataJson")),
+                Checkout: new DbCheckoutState(
+                    State: reader.IsDBNull(reader.GetOrdinal("CheckoutState")) ? "unknown" : reader.GetString(reader.GetOrdinal("CheckoutState")),
+                    SubmitState: reader.IsDBNull(reader.GetOrdinal("SubmitState")) ? "not_started" : reader.GetString(reader.GetOrdinal("SubmitState")),
+                    ReferenceNumber: reader.IsDBNull(reader.GetOrdinal("ReferenceNumber")) ? null : reader.GetString(reader.GetOrdinal("ReferenceNumber")),
+                    TransactionId: reader.IsDBNull(reader.GetOrdinal("TransactionId")) ? null : reader.GetString(reader.GetOrdinal("TransactionId")),
+                    ReturnCode: reader.IsDBNull(reader.GetOrdinal("ReturnCode")) ? null : reader.GetString(reader.GetOrdinal("ReturnCode")),
+                    ReturnMessage: reader.IsDBNull(reader.GetOrdinal("ReturnMessage")) ? null : reader.GetString(reader.GetOrdinal("ReturnMessage"))));
+        }
+
+        static object BuildDbCheckoutResponse(DbCheckoutOrder order, bool replay, string traceId) => new
+        {
+            ok = order.Checkout.State == "paid" && order.Checkout.SubmitState == "done",
+            replay,
+            orderId = order.OrderId,
+            payment = order.Checkout.State == "paid" ? "paid" : "unpaid",
+            status = order.Status,
+            paymentMethod = order.PaymentMethod,
+            checkoutState = order.Checkout.State,
+            submitState = order.Checkout.SubmitState,
+            referenceNumber = order.Checkout.ReferenceNumber,
+            transactionId = order.Checkout.TransactionId,
+            traceId,
+            storageMode = "sql",
+            storageWarning = (string?)null
+        };
+
+        if (req.CheckoutOrderId <= 0)
+        {
+            return Results.BadRequest(new { ok = false, error = "checkoutOrderId required", traceId = ctx.TraceIdentifier });
+        }
+
+        var paymentMode = NormalizePaymentMode(req.PaymentMode);
+        if (string.IsNullOrWhiteSpace(paymentMode))
+        {
+            return Results.BadRequest(new { ok = false, error = "settle paymentMode must be cash", traceId = ctx.TraceIdentifier });
+        }
+
+        await using var conn = await OpenConnectionAsync(config, ct);
+        var existing = await FindByOrderIdAsync(conn, req.CheckoutOrderId, req.MiniAppId, ct);
+        if (existing is null)
+        {
+            return Results.NotFound(new { ok = false, error = "Order not found", traceId = ctx.TraceIdentifier });
+        }
+
+        if (existing.Checkout.State == "paid")
+        {
+            return Results.Ok(BuildDbCheckoutResponse(existing, replay: true, ctx.TraceIdentifier));
+        }
+
+        if (existing.Checkout.State != "pay_later")
+        {
+            return Results.BadRequest(new { ok = false, error = $"Order state must be pay_later, found {existing.Checkout.State}", traceId = ctx.TraceIdentifier });
+        }
+
+        var existingOrder = SubmitOrderHelper.TryExtractOrder(existing.MetadataJson);
+        if (existingOrder is null)
+        {
+            return Results.Conflict(new { ok = false, error = "Could not extract order payload from checkout metadata", traceId = ctx.TraceIdentifier });
+        }
+
+        var submittedOrderId = SubmitOrderHelper.TryExtractSubmittedOrderId(existing.MetadataJson);
+        if (!submittedOrderId.HasValue || submittedOrderId.Value <= 0)
+        {
+            return Results.Conflict(new { ok = false, error = "Could not find submitted downstream orderId to update", traceId = ctx.TraceIdentifier });
+        }
+
+        var mergedOrder = MergeOrder(existingOrder, req.Order, existing.Amount);
+        var currency = ResolveCurrency(mergedOrder, req.Currency);
+        var settlementIdempotencyKey = NormalizeIdempotency(req.IdempotencyKey, existing.OrderId);
+        var submitMode = ResolveSubmitMode(config, app.Environment);
+        var metadataNode = JsonNode.Parse(existing.MetadataJson) as JsonObject ?? new JsonObject();
+        var checkoutNode = metadataNode["checkout"] as JsonObject ?? new JsonObject();
+        metadataNode["checkout"] = checkoutNode;
+        checkoutNode["provider"] = "offline";
+        checkoutNode["method"] = "cash";
+        checkoutNode["state"] = "paid";
+        checkoutNode["submitState"] = existing.Checkout.SubmitState;
+        checkoutNode["amount"] = existing.Amount;
+        checkoutNode["currency"] = currency;
+        checkoutNode["transactionType"] = null;
+        checkoutNode["referenceNumber"] = null;
+        checkoutNode["transactionId"] = null;
+        checkoutNode["returnCode"] = null;
+        checkoutNode["returnMessage"] = "Cash accepted";
+        checkoutNode["updatedAtUtc"] = DateTime.UtcNow.ToString("O");
+        metadataNode["orderSource"] = NormalizeSource(mergedOrder.Source);
+        metadataNode["order"] = JsonSerializer.SerializeToNode(mergedOrder);
+        metadataNode["basketCount"] = mergedOrder.Basket?.Count ?? 0;
+
+        string submitState = submitMode == "off" ? "not_started" : existing.Checkout.SubmitState;
+        if (submitMode != "off")
+        {
+            var submitResult = await SubmitOrderHelper.SubmitAsync(
+                httpFactory,
+                config,
+                log,
+                app.Environment,
+                mergedOrder,
+                existing.MiniAppId,
+                existing.OrderId,
+                existing.Amount,
+                currency,
+                settlementIdempotencyKey,
+                null,
+                "",
+                new GatewayResult("paid", null, null, null, "Cash accepted"),
+                submittedOrderId,
+                ct);
+
+            submitState = submitResult.SubmitState;
+            SubmitOrderHelper.ApplySubmitResult(metadataNode, submitResult);
+            checkoutNode["submitState"] = submitState;
+        }
+
+        const string updateSql = """
+UPDATE dbo.Orders
+SET
+    Status = 1,
+    PaymentMethod = 'cash',
+    PaymentReference = NULL,
+    PaymentApprovedAtUtc = SYSUTCDATETIME(),
+    Metadata = @Metadata,
+    UpdatedAt = SYSUTCDATETIME()
+WHERE Id = @Id;
+""";
+
+        await using var update = new SqlCommand(updateSql, conn);
+        update.Parameters.AddWithValue("@Id", existing.OrderId);
+        update.Parameters.AddWithValue("@Metadata", metadataNode.ToJsonString());
+        await update.ExecuteNonQueryAsync(ct);
+
+        var finalOrder = await FindByOrderIdAsync(conn, existing.OrderId, existing.MiniAppId, ct)
+            ?? throw new InvalidOperationException($"Offline settled order {existing.OrderId} could not be reloaded.");
+
+        return Results.Ok(BuildDbCheckoutResponse(finalOrder, replay: false, ctx.TraceIdentifier));
+    }
+    catch (Exception ex)
+    {
+        log.LogError(ex, "Offline settle endpoint failed trace={Trace}", ctx.TraceIdentifier);
         return Results.Json(new
         {
             ok = false,
@@ -2195,6 +2507,14 @@ internal record CheckoutReconcileRequest(
 internal record CheckoutOfflineRequest(
     int? MiniAppId,
     decimal Amount,
+    string? Currency,
+    string? IdempotencyKey,
+    string? PaymentMode,
+    CheckoutOrderPayload? Order);
+
+internal record CheckoutOfflineSettleRequest(
+    int CheckoutOrderId,
+    int? MiniAppId,
     string? Currency,
     string? IdempotencyKey,
     string? PaymentMode,
@@ -2392,6 +2712,26 @@ internal static class SubmitOrderHelper
         }
     }
 
+    public static int? TryExtractSubmittedOrderId(string metadataJson)
+    {
+        try
+        {
+            var root = JsonNode.Parse(metadataJson) as JsonObject;
+            var submitNode = root?["submit"] as JsonObject;
+            if (submitNode?["orderId"] is JsonValue value &&
+                value.TryGetValue<int>(out var parsed) &&
+                parsed > 0)
+            {
+                return parsed;
+            }
+        }
+        catch
+        {
+        }
+
+        return null;
+    }
+
     public static void ApplySubmitResult(JsonObject metadataNode, SubmitOrderAttemptResult result)
     {
         var checkoutNode = metadataNode["checkout"] as JsonObject ?? new JsonObject();
@@ -2454,6 +2794,7 @@ internal static class SubmitOrderHelper
         string? pinpadId,
         string transactionType,
         GatewayResult gatewayResult,
+        int? existingSubmittedOrderId,
         CancellationToken ct)
     {
         var mode = ResolveMode(config, env);
@@ -2469,7 +2810,7 @@ internal static class SubmitOrderHelper
             log.LogInformation(
                 "Fake submitOrder miniAppId={MiniAppId} checkoutOrderId={CheckoutOrderId} idem={Idem}",
                 miniAppId, checkoutOrderId, idempotencyKey);
-            return new SubmitOrderAttemptResult("done", checkoutOrderId + 500000, false, 200, null, attemptedAtUtc, null, null, null, "OK", null);
+            return new SubmitOrderAttemptResult("done", existingSubmittedOrderId ?? checkoutOrderId + 500000, false, 200, null, attemptedAtUtc, null, null, null, "OK", null);
         }
 
         var url = (config["CheckoutDebug:SubmitOrderUrl"] ?? "https://minis.studio/submitOrder").Trim();
@@ -2478,7 +2819,7 @@ internal static class SubmitOrderHelper
             return new SubmitOrderAttemptResult("failed", null, null, null, "Missing CheckoutDebug:SubmitOrderUrl", attemptedAtUtc, null, url, null, null, null);
         }
 
-        var payload = BuildSubmitPayload(order, miniAppId, amount, currency, idempotencyKey, pinpadId, transactionType, gatewayResult);
+        var payload = BuildSubmitPayload(order, miniAppId, amount, currency, idempotencyKey, pinpadId, transactionType, gatewayResult, existingSubmittedOrderId);
         var payloadJson = payload.ToJsonString();
         using var req = new HttpRequestMessage(HttpMethod.Post, url)
         {
@@ -2554,7 +2895,8 @@ internal static class SubmitOrderHelper
         string idempotencyKey,
         string? pinpadId,
         string transactionType,
-        GatewayResult gatewayResult)
+        GatewayResult gatewayResult,
+        int? existingSubmittedOrderId)
     {
         var source = NormalizeSource(order.Source);
         var payload = new JsonObject
@@ -2595,6 +2937,11 @@ internal static class SubmitOrderHelper
                 ["transactionType"] = transactionType
             }
         };
+
+        if (existingSubmittedOrderId.HasValue && existingSubmittedOrderId.Value > 0)
+        {
+            payload["orderId"] = existingSubmittedOrderId.Value;
+        }
 
         if (!string.IsNullOrWhiteSpace(order.DiningMode))
         {
