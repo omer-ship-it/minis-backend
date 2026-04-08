@@ -75,6 +75,15 @@ app.MapGet("/debug/config", (IConfiguration cfg) => Results.Ok(new
         cfg["WEBSITE_SLOT_NAME"]
 }));
 
+app.MapGet("/debug/host", () => Results.Ok(new
+{
+    machineName = Environment.MachineName,
+    websiteInstanceId = Environment.GetEnvironmentVariable("WEBSITE_INSTANCE_ID"),
+    websiteSiteName = Environment.GetEnvironmentVariable("WEBSITE_SITE_NAME"),
+    websiteHostName = Environment.GetEnvironmentVariable("WEBSITE_HOSTNAME"),
+    computerName = Environment.GetEnvironmentVariable("COMPUTERNAME")
+}));
+
 app.MapGet("/health/full", async (IConfiguration config) =>
 {
     var checks = new Dictionary<string, object?>();
