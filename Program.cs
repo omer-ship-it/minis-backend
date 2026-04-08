@@ -1417,6 +1417,638 @@ WHERE Id = @Id;
     }
 });
 
+app.MapPost("/checkout/offline", async (
+    CheckoutOfflineRequest req,
+    IConfiguration config,
+    IHttpClientFactory httpFactory,
+    HttpContext ctx,
+    ILogger<Program> log,
+    CancellationToken ct) =>
+{
+    try
+    {
+        static decimal R2(decimal value) => Math.Round(value, 2, MidpointRounding.AwayFromZero);
+
+        static string NormalizeIdempotency(string? raw) =>
+            string.IsNullOrWhiteSpace(raw) ? Guid.NewGuid().ToString("N") : raw.Trim();
+
+        static string NormalizeSource(string? raw) => "cashpoint";
+
+        static string ResolveSubmitMode(IConfiguration cfg, IHostEnvironment env)
+        {
+            var configured = (cfg["CheckoutDebug:SubmitMode"] ?? "").Trim().ToLowerInvariant();
+            if (configured is "off" or "fake" or "real")
+            {
+                return configured;
+            }
+
+            return env.IsDevelopment() ? "fake" : "real";
+        }
+
+        static string? ResolveWriteConnectionString(IConfiguration cfg) =>
+            cfg.GetConnectionString("DefaultConnection")
+            ?? Environment.GetEnvironmentVariable("SQL_CONNECTION");
+
+        static bool AllowMemoryFallback(IConfiguration cfg, IHostEnvironment env)
+        {
+            var configured = cfg["CheckoutDebug:AllowMemoryFallback"];
+            if (!string.IsNullOrWhiteSpace(configured) && bool.TryParse(configured, out var parsed))
+            {
+                return parsed;
+            }
+
+            return env.IsDevelopment();
+        }
+
+        static string BuildMemoryKey(int miniAppId, string idempotencyKey) => $"offline:{miniAppId}:{idempotencyKey}";
+
+        static async Task<SqlConnection> OpenConnectionAsync(IConfiguration cfg, CancellationToken token)
+        {
+            var connectionString = ResolveWriteConnectionString(cfg);
+            if (string.IsNullOrWhiteSpace(connectionString))
+            {
+                throw new InvalidOperationException("Missing write connection string. Set ConnectionStrings:DefaultConnection or SQL_CONNECTION.");
+            }
+
+            var connection = new SqlConnection(connectionString);
+            await connection.OpenAsync(token);
+            return connection;
+        }
+
+        static string NormalizePaymentMode(string? raw)
+        {
+            var value = (raw ?? "").Trim().ToLowerInvariant();
+            return value switch
+            {
+                "cash" => "cash",
+                "pay_later" => "pay_later",
+                "paylater" => "pay_later",
+                "later" => "pay_later",
+                _ => ""
+            };
+        }
+
+        static string ResolveCheckoutState(string paymentMode) => paymentMode == "cash" ? "paid" : "pay_later";
+
+        static string ResolvePaymentMethod(string paymentMode) => paymentMode == "cash" ? "cash" : "unpaid";
+
+        static string ResolvePaymentResponse(string paymentMode) => paymentMode == "cash" ? "paid" : "unpaid";
+
+        static JsonElement BuildOfflinePaymentElement(string paymentMode, decimal amount)
+        {
+            object payload = paymentMode == "cash"
+                ? new
+                {
+                    provider = "minis",
+                    method = "cash",
+                    cardAmount = 0m,
+                    cashAmount = amount
+                }
+                : new
+                {
+                    provider = "minis",
+                    method = "unpaid",
+                    cardAmount = 0m,
+                    cashAmount = 0m
+                };
+
+            return JsonSerializer.SerializeToElement(payload);
+        }
+
+        static async Task<DbCheckoutOrder?> FindExistingAsync(SqlConnection conn, int miniAppId, string idempotencyKey, CancellationToken token)
+        {
+            const string sql = """
+SELECT TOP (1)
+    Id,
+    MiniAppId,
+    Total,
+    Status,
+    ISNULL(PaymentMethod, 'unpaid') AS PaymentMethod,
+    CreatedAt,
+    UpdatedAt,
+    ISNULL(CAST(Metadata AS nvarchar(max)), '{}') AS MetadataJson,
+    JSON_VALUE(Metadata, '$.checkout.state') AS CheckoutState,
+    JSON_VALUE(Metadata, '$.checkout.submitState') AS SubmitState,
+    JSON_VALUE(Metadata, '$.checkout.referenceNumber') AS ReferenceNumber,
+    JSON_VALUE(Metadata, '$.checkout.transactionId') AS TransactionId,
+    JSON_VALUE(Metadata, '$.checkout.returnCode') AS ReturnCode,
+    JSON_VALUE(Metadata, '$.checkout.returnMessage') AS ReturnMessage
+FROM dbo.Orders
+WHERE MiniAppId = @MiniAppId
+  AND IdempotencyKeyRaw = @IdempotencyKey
+ORDER BY Id DESC;
+""";
+
+            await using var cmd = new SqlCommand(sql, conn);
+            cmd.Parameters.AddWithValue("@MiniAppId", miniAppId);
+            cmd.Parameters.AddWithValue("@IdempotencyKey", idempotencyKey);
+
+            await using var reader = await cmd.ExecuteReaderAsync(token);
+            if (!await reader.ReadAsync(token))
+            {
+                return null;
+            }
+
+            return new DbCheckoutOrder(
+                OrderId: reader.GetInt32(reader.GetOrdinal("Id")),
+                MiniAppId: reader.GetInt32(reader.GetOrdinal("MiniAppId")),
+                Amount: reader.GetDecimal(reader.GetOrdinal("Total")),
+                Status: reader.GetInt32(reader.GetOrdinal("Status")),
+                PaymentMethod: reader.GetString(reader.GetOrdinal("PaymentMethod")),
+                CreatedAtUtc: reader.GetDateTime(reader.GetOrdinal("CreatedAt")),
+                UpdatedAtUtc: reader.GetDateTime(reader.GetOrdinal("UpdatedAt")),
+                MetadataJson: reader.GetString(reader.GetOrdinal("MetadataJson")),
+                Checkout: new DbCheckoutState(
+                    State: reader.IsDBNull(reader.GetOrdinal("CheckoutState")) ? "unknown" : reader.GetString(reader.GetOrdinal("CheckoutState")),
+                    SubmitState: reader.IsDBNull(reader.GetOrdinal("SubmitState")) ? "not_started" : reader.GetString(reader.GetOrdinal("SubmitState")),
+                    ReferenceNumber: reader.IsDBNull(reader.GetOrdinal("ReferenceNumber")) ? null : reader.GetString(reader.GetOrdinal("ReferenceNumber")),
+                    TransactionId: reader.IsDBNull(reader.GetOrdinal("TransactionId")) ? null : reader.GetString(reader.GetOrdinal("TransactionId")),
+                    ReturnCode: reader.IsDBNull(reader.GetOrdinal("ReturnCode")) ? null : reader.GetString(reader.GetOrdinal("ReturnCode")),
+                    ReturnMessage: reader.IsDBNull(reader.GetOrdinal("ReturnMessage")) ? null : reader.GetString(reader.GetOrdinal("ReturnMessage"))));
+        }
+
+        static object BuildDbCheckoutResponse(DbCheckoutOrder order, string payment, bool replay, string traceId, string storageMode, string? storageWarning = null) => new
+        {
+            ok = order.Checkout.State == "paid",
+            replay,
+            orderId = order.OrderId,
+            payment,
+            status = order.Status,
+            paymentMethod = order.PaymentMethod,
+            checkoutState = order.Checkout.State,
+            submitState = order.Checkout.SubmitState,
+            referenceNumber = order.Checkout.ReferenceNumber,
+            transactionId = order.Checkout.TransactionId,
+            traceId,
+            storageMode,
+            storageWarning
+        };
+
+        static object BuildMemoryCheckoutResponse(MemoryCheckoutOrder order, string payment, bool replay, string traceId, string storageMode, string? storageWarning = null) => new
+        {
+            ok = order.Checkout.State == "paid",
+            replay,
+            orderId = order.OrderId,
+            payment,
+            status = order.Status,
+            paymentMethod = order.PaymentMethod,
+            checkoutState = order.Checkout.State,
+            submitState = order.Checkout.SubmitState,
+            referenceNumber = order.Checkout.ReferenceNumber,
+            transactionId = order.Checkout.TransactionId,
+            traceId,
+            storageMode,
+            storageWarning
+        };
+
+        static string BuildMetadataJson(
+            CheckoutOfflineRequest request,
+            CheckoutOrderPayload order,
+            int miniAppId,
+            string idempotencyKey,
+            string orderSource,
+            decimal amount,
+            string currency,
+            string paymentMode,
+            string checkoutState,
+            string submitState,
+            int? submittedOrderId = null,
+            bool? submitReplay = null,
+            int? submitHttpStatus = null,
+            string? submitError = null,
+            DateTime? submitAttemptedAtUtc = null)
+        {
+            var now = DateTime.UtcNow;
+            var metadata = new
+            {
+                schema = "checkout.debug.v1",
+                shopId = miniAppId,
+                idempotency = idempotencyKey,
+                createdAtUtc = now,
+                orderSource,
+                pinpadId = (string?)null,
+                checkout = new
+                {
+                    provider = "offline",
+                    method = paymentMode,
+                    state = checkoutState,
+                    submitState,
+                    amount,
+                    currency,
+                    transactionType = (string?)null,
+                    referenceNumber = (string?)null,
+                    transactionId = (string?)null,
+                    returnCode = (string?)null,
+                    returnMessage = paymentMode == "cash" ? "Cash accepted" : "Pay later accepted",
+                    updatedAtUtc = now
+                },
+                submit = new
+                {
+                    state = submitState,
+                    orderId = submittedOrderId,
+                    replay = submitReplay,
+                    httpStatus = submitHttpStatus,
+                    error = submitError,
+                    attemptedAtUtc = submitAttemptedAtUtc
+                },
+                order = order,
+                basketCount = order.Basket?.Count ?? 0
+            };
+
+            return JsonSerializer.Serialize(metadata);
+        }
+
+        static async Task<int> InsertPendingOrderAsync(
+            SqlConnection conn,
+            CheckoutOfflineRequest request,
+            CheckoutOrderPayload order,
+            int miniAppId,
+            string idempotencyKey,
+            decimal amount,
+            string currency,
+            string paymentMode,
+            string checkoutState,
+            CancellationToken token)
+        {
+            var orderSource = NormalizeSource(order.Source);
+            var metadataJson = BuildMetadataJson(
+                request,
+                order,
+                miniAppId,
+                idempotencyKey,
+                orderSource,
+                amount,
+                currency,
+                paymentMode,
+                checkoutState,
+                "not_started");
+
+            const string sql = """
+INSERT INTO dbo.Orders
+(
+    MiniAppId,
+    CustomerId,
+    Total,
+    Status,
+    Metadata,
+    CreatedAt,
+    UpdatedAt,
+    Source,
+    PaymentMethod,
+    TicketNumber,
+    AutoPrintEligible,
+    IdempotencyKeyRaw
+)
+VALUES
+(
+    @MiniAppId,
+    @CustomerId,
+    @Total,
+    @Status,
+    @Metadata,
+    SYSUTCDATETIME(),
+    SYSUTCDATETIME(),
+    @Source,
+    @PaymentMethod,
+    NULL,
+    0,
+    @IdempotencyKey
+);
+SELECT CAST(SCOPE_IDENTITY() AS int);
+""";
+
+            await using var cmd = new SqlCommand(sql, conn);
+            cmd.Parameters.AddWithValue("@MiniAppId", miniAppId);
+            cmd.Parameters.AddWithValue("@CustomerId", (object?)order.CustomerId ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("@Total", amount);
+            cmd.Parameters.AddWithValue("@Status", checkoutState == "paid" ? 1 : 0);
+            cmd.Parameters.AddWithValue("@Metadata", metadataJson);
+            cmd.Parameters.AddWithValue("@Source", orderSource);
+            cmd.Parameters.AddWithValue("@PaymentMethod", ResolvePaymentMethod(paymentMode));
+            cmd.Parameters.AddWithValue("@IdempotencyKey", idempotencyKey);
+
+            var result = await cmd.ExecuteScalarAsync(token);
+            return Convert.ToInt32(result);
+        }
+
+        static async Task UpdateOrderAsync(
+            SqlConnection conn,
+            int orderId,
+            CheckoutOfflineRequest request,
+            CheckoutOrderPayload order,
+            int miniAppId,
+            string idempotencyKey,
+            decimal amount,
+            string currency,
+            string paymentMode,
+            string checkoutState,
+            string submitState,
+            int? submittedOrderId,
+            bool? submitReplay,
+            int? submitHttpStatus,
+            string? submitError,
+            DateTime? submitAttemptedAtUtc,
+            CancellationToken token)
+        {
+            var orderSource = NormalizeSource(order.Source);
+            var metadataJson = BuildMetadataJson(
+                request,
+                order,
+                miniAppId,
+                idempotencyKey,
+                orderSource,
+                amount,
+                currency,
+                paymentMode,
+                checkoutState,
+                submitState,
+                submittedOrderId,
+                submitReplay,
+                submitHttpStatus,
+                submitError,
+                submitAttemptedAtUtc);
+
+            const string sql = """
+UPDATE dbo.Orders
+SET
+    Total = @Total,
+    Status = @Status,
+    PaymentMethod = @PaymentMethod,
+    PaymentReference = NULL,
+    PaymentApprovedAtUtc = @PaymentApprovedAtUtc,
+    Metadata = @Metadata,
+    UpdatedAt = SYSUTCDATETIME()
+WHERE Id = @Id;
+""";
+
+            await using var cmd = new SqlCommand(sql, conn);
+            cmd.Parameters.AddWithValue("@Id", orderId);
+            cmd.Parameters.AddWithValue("@Total", amount);
+            cmd.Parameters.AddWithValue("@Status", checkoutState == "paid" ? 1 : 0);
+            cmd.Parameters.AddWithValue("@PaymentMethod", ResolvePaymentMethod(paymentMode));
+            cmd.Parameters.AddWithValue("@PaymentApprovedAtUtc",
+                checkoutState == "paid"
+                    ? DateTime.UtcNow
+                    : DBNull.Value);
+            cmd.Parameters.AddWithValue("@Metadata", metadataJson);
+            await cmd.ExecuteNonQueryAsync(token);
+        }
+
+        if (req is null || req.Order is null)
+        {
+            return Results.BadRequest(new { ok = false, error = "order required", traceId = ctx.TraceIdentifier });
+        }
+
+        var paymentMode = NormalizePaymentMode(req.PaymentMode);
+        if (string.IsNullOrWhiteSpace(paymentMode))
+        {
+            return Results.BadRequest(new { ok = false, error = "paymentMode must be cash or pay_later", traceId = ctx.TraceIdentifier });
+        }
+
+        var order = req.Order;
+        var miniAppId = req.MiniAppId.GetValueOrDefault() > 0 ? req.MiniAppId!.Value : order.MiniAppId;
+        if (miniAppId <= 0)
+        {
+            return Results.BadRequest(new { ok = false, error = "miniAppId required", traceId = ctx.TraceIdentifier });
+        }
+
+        if (req.Amount <= 0)
+        {
+            return Results.BadRequest(new { ok = false, error = "amount must be > 0", traceId = ctx.TraceIdentifier });
+        }
+
+        if (!order.CustomerId.HasValue || order.CustomerId.Value <= 0)
+        {
+            return Results.BadRequest(new { ok = false, error = "order.customerId is required", traceId = ctx.TraceIdentifier });
+        }
+
+        string? Corr(string key) =>
+            ctx.Request.Headers.TryGetValue(key, out var value) && !string.IsNullOrWhiteSpace(value)
+                ? value.ToString()
+                : null;
+
+        var idempotencyKey = NormalizeIdempotency(
+            Corr("Idempotency-Key")
+            ?? Corr("X-Request-Id")
+            ?? req.IdempotencyKey
+            ?? order.IdempotencyKey);
+
+        var traceId = ctx.TraceIdentifier;
+        var amount = R2(req.Amount);
+        var currency = string.IsNullOrWhiteSpace(req.Currency) ? "ILS" : req.Currency.Trim().ToUpperInvariant();
+        var allowMemoryFallback = AllowMemoryFallback(config, app.Environment);
+        var submitMode = ResolveSubmitMode(config, app.Environment);
+        var normalizedOrder = req.Order with
+        {
+            Source = NormalizeSource(req.Order.Source),
+            Payment = BuildOfflinePaymentElement(paymentMode, amount)
+        };
+        var checkoutState = ResolveCheckoutState(paymentMode);
+        var paymentResponse = ResolvePaymentResponse(paymentMode);
+
+        SqlConnection? conn = null;
+        string? storageWarning = null;
+        try
+        {
+            conn = await OpenConnectionAsync(config, ct);
+        }
+        catch (Exception ex) when (allowMemoryFallback)
+        {
+            storageWarning = $"SQL unavailable, using memory fallback: {ex.Message}";
+            log.LogWarning(ex,
+                "Offline checkout SQL unavailable, falling back to memory miniAppId={MiniAppId} idem={Idem} mode={Mode} trace={Trace}",
+                miniAppId, idempotencyKey, paymentMode, traceId);
+        }
+
+        async Task<IResult> RunMemoryCheckoutAsync()
+        {
+            var memoryKey = BuildMemoryKey(miniAppId, idempotencyKey);
+            if (memoryCheckoutStore.TryGetValue(memoryKey, out var existingMemory))
+            {
+                return existingMemory.Checkout.State switch
+                {
+                    "paid" => Results.Ok(BuildMemoryCheckoutResponse(existingMemory, ResolvePaymentResponse(existingMemory.PaymentMethod == "cash" ? "cash" : "pay_later"), replay: true, traceId, "memory", storageWarning)),
+                    "pay_later" => Results.Ok(BuildMemoryCheckoutResponse(existingMemory, "unpaid", replay: true, traceId, "memory", storageWarning)),
+                    _ => Results.Json(BuildMemoryCheckoutResponse(existingMemory, ResolvePaymentResponse(paymentMode), replay: true, traceId, "memory", storageWarning), statusCode: 202)
+                };
+            }
+
+            var createdAtUtc = DateTime.UtcNow;
+            var memoryOrderId = Interlocked.Increment(ref memoryOrderSequence);
+            var initialSubmitState = submitMode == "off" ? "not_started" : "done";
+            var offlineMemory = new MemoryCheckoutOrder(
+                OrderId: memoryOrderId,
+                MiniAppId: miniAppId,
+                IdempotencyKey: idempotencyKey,
+                Amount: amount,
+                Currency: currency,
+                Status: checkoutState == "paid" ? 1 : 0,
+                PaymentMethod: ResolvePaymentMethod(paymentMode),
+                CreatedAtUtc: createdAtUtc,
+                UpdatedAtUtc: createdAtUtc,
+                Checkout: new MemoryCheckoutState(checkoutState, initialSubmitState, null, null, null, paymentMode == "cash" ? "Cash accepted" : "Pay later accepted"));
+
+            memoryCheckoutStore[memoryKey] = offlineMemory;
+            return Results.Ok(BuildMemoryCheckoutResponse(offlineMemory, paymentResponse, replay: false, traceId, "memory", storageWarning));
+        }
+
+        if (conn is null)
+        {
+            if (!allowMemoryFallback)
+            {
+                throw new InvalidOperationException("SQL storage is required for this environment and no connection could be opened.");
+            }
+
+            return await RunMemoryCheckoutAsync();
+        }
+
+        await using (conn)
+        {
+            try
+            {
+                var existing = await FindExistingAsync(conn, miniAppId, idempotencyKey, ct);
+                if (existing is not null)
+                {
+                    if ((existing.Checkout.State is "paid" or "pay_later") && existing.Checkout.SubmitState != "done" && submitMode != "off")
+                    {
+                        var submitResult = await SubmitOrderHelper.SubmitAsync(
+                            httpFactory,
+                            config,
+                            log,
+                            app.Environment,
+                            normalizedOrder,
+                            miniAppId,
+                            existing.OrderId,
+                            amount,
+                            currency,
+                            idempotencyKey,
+                            null,
+                            "",
+                            new GatewayResult(
+                                existing.Checkout.State,
+                                existing.Checkout.ReferenceNumber,
+                                existing.Checkout.TransactionId,
+                                existing.Checkout.ReturnCode,
+                                existing.Checkout.ReturnMessage),
+                            ct);
+
+                        await UpdateOrderAsync(
+                            conn,
+                            existing.OrderId,
+                            req,
+                            normalizedOrder,
+                            miniAppId,
+                            idempotencyKey,
+                            amount,
+                            currency,
+                            paymentMode,
+                            existing.Checkout.State,
+                            submitResult.SubmitState,
+                            submitResult.SubmittedOrderId,
+                            submitResult.Replay,
+                            submitResult.HttpStatus,
+                            submitResult.Error,
+                            submitResult.AttemptedAtUtc,
+                            ct);
+
+                        existing = await FindExistingAsync(conn, miniAppId, idempotencyKey, ct) ?? existing;
+                    }
+
+                    return existing.Checkout.State switch
+                    {
+                        "paid" => Results.Ok(BuildDbCheckoutResponse(existing, "paid", replay: true, traceId, "sql")),
+                        "pay_later" => Results.Ok(BuildDbCheckoutResponse(existing, "unpaid", replay: true, traceId, "sql")),
+                        _ => Results.Json(BuildDbCheckoutResponse(existing, paymentResponse, replay: true, traceId, "sql"), statusCode: 202)
+                    };
+                }
+
+                var orderId = await InsertPendingOrderAsync(conn, req, normalizedOrder, miniAppId, idempotencyKey, amount, currency, paymentMode, checkoutState, ct);
+
+                string submitState = "not_started";
+                int? submittedOrderId = null;
+                bool? submitReplay = null;
+                int? submitHttpStatus = null;
+                string? submitError = null;
+                DateTime? submitAttemptedAtUtc = null;
+
+                if (submitMode != "off")
+                {
+                    var submitResult = await SubmitOrderHelper.SubmitAsync(
+                        httpFactory,
+                        config,
+                        log,
+                        app.Environment,
+                        normalizedOrder,
+                        miniAppId,
+                        orderId,
+                        amount,
+                        currency,
+                        idempotencyKey,
+                        null,
+                        "",
+                        new GatewayResult(checkoutState, null, null, null, paymentMode == "cash" ? "Cash accepted" : "Pay later accepted"),
+                        ct);
+
+                    submitState = submitResult.SubmitState;
+                    submittedOrderId = submitResult.SubmittedOrderId;
+                    submitReplay = submitResult.Replay;
+                    submitHttpStatus = submitResult.HttpStatus;
+                    submitError = submitResult.Error;
+                    submitAttemptedAtUtc = submitResult.AttemptedAtUtc;
+                }
+
+                await UpdateOrderAsync(
+                    conn,
+                    orderId,
+                    req,
+                    normalizedOrder,
+                    miniAppId,
+                    idempotencyKey,
+                    amount,
+                    currency,
+                    paymentMode,
+                    checkoutState,
+                    submitState,
+                    submittedOrderId,
+                    submitReplay,
+                    submitHttpStatus,
+                    submitError,
+                    submitAttemptedAtUtc,
+                    ct);
+
+                var finalOrder = await FindExistingAsync(conn, miniAppId, idempotencyKey, ct)
+                    ?? throw new InvalidOperationException($"Offline order {orderId} was updated but could not be reloaded.");
+
+                var statusCode = checkoutState == "paid" || checkoutState == "pay_later"
+                    ? StatusCodes.Status200OK
+                    : StatusCodes.Status202Accepted;
+
+                return Results.Json(BuildDbCheckoutResponse(finalOrder, paymentResponse, replay: false, traceId, "sql"), statusCode: statusCode);
+            }
+            catch (SqlException ex) when (allowMemoryFallback && ex.Number == 208)
+            {
+                storageWarning = $"SQL schema unavailable, using memory fallback: {ex.Message}";
+                log.LogWarning(ex,
+                    "Offline checkout SQL schema missing, falling back to memory miniAppId={MiniAppId} idem={Idem} mode={Mode} trace={Trace}",
+                    miniAppId, idempotencyKey, paymentMode, traceId);
+
+                return await RunMemoryCheckoutAsync();
+            }
+        }
+    }
+    catch (Exception ex)
+    {
+        log.LogError(ex, "Offline checkout endpoint failed trace={Trace}", ctx.TraceIdentifier);
+        return Results.Json(new
+        {
+            ok = false,
+            error = ex.Message,
+            type = ex.GetType().FullName,
+            traceId = ctx.TraceIdentifier
+        }, statusCode: 500);
+    }
+});
+
 app.MapGet("/checkout/debug/orders", async (IConfiguration config, CancellationToken ct) =>
 {
     var connectionString =
@@ -1559,6 +2191,14 @@ internal record CheckoutZcreditCardRequest(
 internal record CheckoutReconcileRequest(
     int MiniAppId,
     string IdempotencyKey);
+
+internal record CheckoutOfflineRequest(
+    int? MiniAppId,
+    decimal Amount,
+    string? Currency,
+    string? IdempotencyKey,
+    string? PaymentMode,
+    CheckoutOrderPayload? Order);
 
 internal record CheckoutOrderPayload(
     int MiniAppId,
