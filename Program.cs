@@ -2616,6 +2616,12 @@ WHERE Id = @Id;
         return Results.BadRequest(new { ok = false, error = "deviceId must be <= 128 chars", traceId = ctx.TraceIdentifier });
     }
 
+    var deviceName = TrimOrNull(req.DeviceName);
+    if (deviceName is { Length: > 128 })
+    {
+        return Results.BadRequest(new { ok = false, error = "deviceName must be <= 128 chars", traceId = ctx.TraceIdentifier });
+    }
+
     var appVersion = TrimOrNull(req.AppVersion);
     if (appVersion is { Length: > 64 })
     {
@@ -2648,13 +2654,14 @@ WHERE Id = @Id;
         return Results.BadRequest(new { ok = false, error = "finishedAt must be >= startedAt", traceId = ctx.TraceIdentifier });
     }
 
-    if (req.AttemptsJson.HasValue &&
-        req.AttemptsJson.Value.ValueKind is not JsonValueKind.Array and not JsonValueKind.Object and not JsonValueKind.Null and not JsonValueKind.Undefined)
+    var attemptsPayload = req.Attempts ?? req.AttemptsJson;
+    if (attemptsPayload.HasValue &&
+        attemptsPayload.Value.ValueKind is not JsonValueKind.Array and not JsonValueKind.Object and not JsonValueKind.Null and not JsonValueKind.Undefined)
     {
-        return Results.BadRequest(new { ok = false, error = "attemptsJson must be an array or object", traceId = ctx.TraceIdentifier });
+        return Results.BadRequest(new { ok = false, error = "attempts/attemptsJson must be an array or object", traceId = ctx.TraceIdentifier });
     }
 
-    var attemptsJson = SerializeJson(req.AttemptsJson);
+    var attemptsJson = SerializeJson(attemptsPayload);
 
     await using var conn = await OpenConnectionAsync(config, ct);
     var existingOrder = await FindOrderAsync(conn, req.OrderId, ct);
@@ -2688,9 +2695,14 @@ WHERE Id = @Id;
     printNode["final"] = new JsonObject
     {
         ["dedupeKey"] = dedupeKey,
+        ["miniAppId"] = req.MiniAppId,
         ["station"] = station,
         ["finalStatus"] = finalStatus,
         ["deviceId"] = deviceId,
+        ["deviceName"] = deviceName,
+        ["localIP"] = TrimOrNull(req.LocalIP),
+        ["isOnPrinterLan"] = req.IsOnPrinterLan,
+        ["printerSet"] = TrimOrNull(req.PrinterSet),
         ["appVersion"] = appVersion,
         ["printerHost"] = printerHost,
         ["printerPort"] = req.PrinterPort,
@@ -2698,7 +2710,7 @@ WHERE Id = @Id;
         ["finishedAt"] = req.FinishedAt?.ToString("O"),
         ["totalDurationMs"] = req.TotalDurationMs,
         ["attemptCount"] = req.AttemptCount,
-        ["attempts"] = CloneJson(req.AttemptsJson),
+        ["attempts"] = CloneJson(attemptsPayload),
         ["updatedAtUtc"] = DateTime.UtcNow.ToString("O")
     };
 
@@ -2766,9 +2778,14 @@ internal record CheckoutOfflineSettleRequest(
 internal record PrintLogFinalRequest(
     string? DedupeKey,
     int OrderId,
+    int? MiniAppId,
     string? Station,
     string? FinalStatus,
     string? DeviceId,
+    string? DeviceName,
+    string? LocalIP,
+    bool? IsOnPrinterLan,
+    string? PrinterSet,
     string? AppVersion,
     string? PrinterHost,
     int? PrinterPort,
@@ -2776,6 +2793,7 @@ internal record PrintLogFinalRequest(
     DateTime? FinishedAt,
     int? TotalDurationMs,
     int AttemptCount = 0,
+    JsonElement? Attempts = null,
     JsonElement? AttemptsJson = null);
 
 internal record CheckoutOrderPayload(
