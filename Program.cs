@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Text.Json.Nodes;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.FileProviders;
 
@@ -1579,12 +1580,65 @@ internal record CheckoutOrderPayload(
     string? OrderType = null,
     string? TabKey = null);
 
-internal record CheckoutBasketItem(
-    int? ProductId,
-    string? Name,
-    int Quantity,
-    decimal Price,
-    string? Modifiers);
+internal sealed class CheckoutBasketItem
+{
+    [JsonNumberHandling(JsonNumberHandling.AllowReadingFromString)]
+    public int? ProductId { get; init; }
+
+    public string? Name { get; init; }
+
+    [JsonNumberHandling(JsonNumberHandling.AllowReadingFromString)]
+    public int Quantity { get; init; }
+
+    [JsonNumberHandling(JsonNumberHandling.AllowReadingFromString)]
+    public decimal Price { get; init; }
+
+    public string? Modifiers { get; init; }
+
+    [JsonExtensionData]
+    public Dictionary<string, JsonElement>? ExtraFields { get; init; }
+
+    public decimal ResolveUnitPrice()
+    {
+        if (Price > 0)
+        {
+            return Price;
+        }
+
+        return ReadDecimal("unitPrice")
+            ?? ReadDecimal("unitTotalPrice")
+            ?? ReadDecimal("unitBasePrice")
+            ?? ((ReadDecimal("lineTotal") is decimal lineTotal && Quantity > 0)
+                ? (decimal?)Math.Round(lineTotal / Quantity, 2, MidpointRounding.AwayFromZero)
+                : null)
+            ?? 0m;
+    }
+
+    public decimal ResolveLineTotal()
+    {
+        var unitPrice = ResolveUnitPrice();
+        return ReadDecimal("lineTotal") ?? (unitPrice * Math.Max(Quantity, 0));
+    }
+
+    private decimal? ReadDecimal(string name)
+    {
+        if (ExtraFields is null || !ExtraFields.TryGetValue(name, out var value))
+        {
+            return null;
+        }
+
+        return value.ValueKind switch
+        {
+            JsonValueKind.Number when value.TryGetDecimal(out var number) => number,
+            JsonValueKind.String when decimal.TryParse(
+                value.GetString(),
+                System.Globalization.NumberStyles.Any,
+                System.Globalization.CultureInfo.InvariantCulture,
+                out var parsed) => parsed,
+            _ => null
+        };
+    }
+}
 
 internal record DbCheckoutOrder(
     int OrderId,
@@ -1906,14 +1960,16 @@ internal static class SubmitOrderHelper
         {
             var item = basket[i];
             var quantity = Math.Max(item.Quantity, 0);
+            var unitPrice = item.ResolveUnitPrice();
+            var lineTotal = item.ResolveLineTotal();
             arr.Add(new JsonObject
             {
                 ["lineId"] = i + 1,
                 ["productId"] = item.ProductId,
                 ["name"] = item.Name,
                 ["quantity"] = quantity,
-                ["unitPrice"] = item.Price,
-                ["lineTotal"] = item.Price * quantity,
+                ["unitPrice"] = unitPrice,
+                ["lineTotal"] = lineTotal,
                 ["modifiers"] = item.Modifiers ?? "",
                 ["isOth"] = false
             });
