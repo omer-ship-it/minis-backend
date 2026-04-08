@@ -42,6 +42,24 @@ app.MapGet("/version", () => Results.Ok(new
     deployedAt = DateTime.UtcNow
 }));
 
+app.MapGet("/debug/config", (IConfiguration cfg) => Results.Ok(new
+{
+    hasGetConnectionStringDefaultConnection =
+        !string.IsNullOrWhiteSpace(cfg.GetConnectionString("DefaultConnection")),
+
+    hasSqlConnection =
+        !string.IsNullOrWhiteSpace(cfg["SQL_CONNECTION"]),
+
+    hasRawDefaultConnection =
+        !string.IsNullOrWhiteSpace(cfg["DefaultConnection"]),
+
+    aspnetcoreEnvironment =
+        cfg["ASPNETCORE_ENVIRONMENT"],
+
+    dotnetEnvironment =
+        cfg["DOTNET_ENVIRONMENT"]
+}));
+
 app.MapGet("/health/full", async (IConfiguration config) =>
 {
     var checks = new Dictionary<string, object?>();
