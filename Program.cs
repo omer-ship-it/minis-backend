@@ -53,11 +53,26 @@ app.MapGet("/debug/config", (IConfiguration cfg) => Results.Ok(new
     hasRawDefaultConnection =
         !string.IsNullOrWhiteSpace(cfg["DefaultConnection"]),
 
+    hasConnectionStringsSectionDefaultConnection =
+        !string.IsNullOrWhiteSpace(cfg["ConnectionStrings:DefaultConnection"]),
+
+    hasEnvSqlConnection =
+        !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("SQL_CONNECTION")),
+
+    hasEnvConnectionStringsDefaultConnection =
+        !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("ConnectionStrings__DefaultConnection")),
+
     aspnetcoreEnvironment =
         cfg["ASPNETCORE_ENVIRONMENT"],
 
     dotnetEnvironment =
-        cfg["DOTNET_ENVIRONMENT"]
+        cfg["DOTNET_ENVIRONMENT"],
+
+    websiteSiteName =
+        cfg["WEBSITE_SITE_NAME"],
+
+    websiteSlotName =
+        cfg["WEBSITE_SLOT_NAME"]
 }));
 
 app.MapGet("/health/full", async (IConfiguration config) =>
