@@ -2494,6 +2494,228 @@ ORDER BY Id DESC;
     });
 });
 
+app.MapPost("/print-log/final", async (
+    PrintLogFinalRequest req,
+    IConfiguration config,
+    HttpContext ctx,
+    ILogger<Program> log,
+    CancellationToken ct) =>
+{
+    static string? ResolveWriteConnectionString(IConfiguration cfg) =>
+        cfg.GetConnectionString("DefaultConnection")
+        ?? Environment.GetEnvironmentVariable("SQL_CONNECTION");
+
+    static string? TrimOrNull(string? value) =>
+        string.IsNullOrWhiteSpace(value) ? null : value.Trim();
+
+    static string? SerializeJson(JsonElement? value) =>
+        value.HasValue && value.Value.ValueKind is not JsonValueKind.Undefined and not JsonValueKind.Null
+            ? value.Value.GetRawText()
+            : null;
+
+    static async Task<SqlConnection> OpenConnectionAsync(IConfiguration cfg, CancellationToken token)
+    {
+        var connectionString = ResolveWriteConnectionString(cfg);
+        if (string.IsNullOrWhiteSpace(connectionString))
+        {
+            throw new InvalidOperationException("Missing write connection string. Set ConnectionStrings:DefaultConnection or SQL_CONNECTION.");
+        }
+
+        var connection = new SqlConnection(connectionString);
+        await connection.OpenAsync(token);
+        return connection;
+    }
+
+    static async Task<long?> FindExistingIdAsync(SqlConnection conn, string dedupeKey, CancellationToken token)
+    {
+        const string sql = """
+SELECT TOP (1) id
+FROM dbo.print_log_final
+WHERE dedupe_key = @DedupeKey;
+""";
+
+        await using var cmd = new SqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("@DedupeKey", dedupeKey);
+        var result = await cmd.ExecuteScalarAsync(token);
+        return result is null || result is DBNull ? null : Convert.ToInt64(result);
+    }
+
+    if (req is null)
+    {
+        return Results.BadRequest(new { ok = false, error = "payload required", traceId = ctx.TraceIdentifier });
+    }
+
+    var dedupeKey = TrimOrNull(req.DedupeKey);
+    if (string.IsNullOrWhiteSpace(dedupeKey))
+    {
+        return Results.BadRequest(new { ok = false, error = "dedupeKey is required", traceId = ctx.TraceIdentifier });
+    }
+
+    if (dedupeKey.Length > 120)
+    {
+        return Results.BadRequest(new { ok = false, error = "dedupeKey must be <= 120 chars", traceId = ctx.TraceIdentifier });
+    }
+
+    if (req.OrderId <= 0)
+    {
+        return Results.BadRequest(new { ok = false, error = "orderId must be > 0", traceId = ctx.TraceIdentifier });
+    }
+
+    var station = TrimOrNull(req.Station);
+    if (string.IsNullOrWhiteSpace(station))
+    {
+        return Results.BadRequest(new { ok = false, error = "station is required", traceId = ctx.TraceIdentifier });
+    }
+
+    if (station.Length > 64)
+    {
+        return Results.BadRequest(new { ok = false, error = "station must be <= 64 chars", traceId = ctx.TraceIdentifier });
+    }
+
+    var finalStatus = TrimOrNull(req.FinalStatus);
+    if (string.IsNullOrWhiteSpace(finalStatus))
+    {
+        return Results.BadRequest(new { ok = false, error = "finalStatus is required", traceId = ctx.TraceIdentifier });
+    }
+
+    if (finalStatus.Length > 32)
+    {
+        return Results.BadRequest(new { ok = false, error = "finalStatus must be <= 32 chars", traceId = ctx.TraceIdentifier });
+    }
+
+    var deviceId = TrimOrNull(req.DeviceId);
+    if (deviceId is { Length: > 128 })
+    {
+        return Results.BadRequest(new { ok = false, error = "deviceId must be <= 128 chars", traceId = ctx.TraceIdentifier });
+    }
+
+    var appVersion = TrimOrNull(req.AppVersion);
+    if (appVersion is { Length: > 64 })
+    {
+        return Results.BadRequest(new { ok = false, error = "appVersion must be <= 64 chars", traceId = ctx.TraceIdentifier });
+    }
+
+    var printerHost = TrimOrNull(req.PrinterHost);
+    if (printerHost is { Length: > 255 })
+    {
+        return Results.BadRequest(new { ok = false, error = "printerHost must be <= 255 chars", traceId = ctx.TraceIdentifier });
+    }
+
+    if (req.PrinterPort.HasValue && (req.PrinterPort.Value < 1 || req.PrinterPort.Value > 65535))
+    {
+        return Results.BadRequest(new { ok = false, error = "printerPort must be between 1 and 65535", traceId = ctx.TraceIdentifier });
+    }
+
+    if (req.TotalDurationMs.HasValue && req.TotalDurationMs.Value < 0)
+    {
+        return Results.BadRequest(new { ok = false, error = "totalDurationMs must be >= 0", traceId = ctx.TraceIdentifier });
+    }
+
+    if (req.AttemptCount < 0)
+    {
+        return Results.BadRequest(new { ok = false, error = "attemptCount must be >= 0", traceId = ctx.TraceIdentifier });
+    }
+
+    if (req.StartedAt.HasValue && req.FinishedAt.HasValue && req.FinishedAt.Value < req.StartedAt.Value)
+    {
+        return Results.BadRequest(new { ok = false, error = "finishedAt must be >= startedAt", traceId = ctx.TraceIdentifier });
+    }
+
+    if (req.AttemptsJson.HasValue &&
+        req.AttemptsJson.Value.ValueKind is not JsonValueKind.Array and not JsonValueKind.Object and not JsonValueKind.Null and not JsonValueKind.Undefined)
+    {
+        return Results.BadRequest(new { ok = false, error = "attemptsJson must be an array or object", traceId = ctx.TraceIdentifier });
+    }
+
+    var attemptsJson = SerializeJson(req.AttemptsJson);
+
+    await using var conn = await OpenConnectionAsync(config, ct);
+
+    try
+    {
+        const string insertSql = """
+INSERT INTO dbo.print_log_final
+(
+    dedupe_key,
+    order_id,
+    station,
+    final_status,
+    device_id,
+    app_version,
+    printer_host,
+    printer_port,
+    started_at,
+    finished_at,
+    total_duration_ms,
+    attempt_count,
+    attempts_json
+)
+VALUES
+(
+    @DedupeKey,
+    @OrderId,
+    @Station,
+    @FinalStatus,
+    @DeviceId,
+    @AppVersion,
+    @PrinterHost,
+    @PrinterPort,
+    @StartedAt,
+    @FinishedAt,
+    @TotalDurationMs,
+    @AttemptCount,
+    @AttemptsJson
+);
+SELECT CAST(SCOPE_IDENTITY() AS bigint);
+""";
+
+        await using var cmd = new SqlCommand(insertSql, conn);
+        cmd.Parameters.AddWithValue("@DedupeKey", dedupeKey);
+        cmd.Parameters.AddWithValue("@OrderId", req.OrderId);
+        cmd.Parameters.AddWithValue("@Station", station);
+        cmd.Parameters.AddWithValue("@FinalStatus", finalStatus);
+        cmd.Parameters.AddWithValue("@DeviceId", (object?)deviceId ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("@AppVersion", (object?)appVersion ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("@PrinterHost", (object?)printerHost ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("@PrinterPort", (object?)req.PrinterPort ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("@StartedAt", (object?)req.StartedAt ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("@FinishedAt", (object?)req.FinishedAt ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("@TotalDurationMs", (object?)req.TotalDurationMs ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("@AttemptCount", req.AttemptCount);
+        cmd.Parameters.AddWithValue("@AttemptsJson", (object?)attemptsJson ?? DBNull.Value);
+
+        var insertedId = Convert.ToInt64(await cmd.ExecuteScalarAsync(ct));
+        log.LogInformation(
+            "Inserted final print log dedupeKey={DedupeKey} orderId={OrderId} rowId={RowId} station={Station} finalStatus={FinalStatus} trace={Trace}",
+            dedupeKey, req.OrderId, insertedId, station, finalStatus, ctx.TraceIdentifier);
+
+        return Results.Ok(new
+        {
+            ok = true,
+            replay = false,
+            id = insertedId,
+            dedupeKey,
+            traceId = ctx.TraceIdentifier
+        });
+    }
+    catch (SqlException ex) when (ex.Number is 2601 or 2627)
+    {
+        var existingId = await FindExistingIdAsync(conn, dedupeKey, ct);
+        log.LogInformation(
+            "Replay final print log dedupeKey={DedupeKey} orderId={OrderId} existingId={ExistingId} trace={Trace}",
+            dedupeKey, req.OrderId, existingId, ctx.TraceIdentifier);
+
+        return Results.Ok(new
+        {
+            ok = true,
+            replay = true,
+            id = existingId,
+            dedupeKey,
+            traceId = ctx.TraceIdentifier
+        });
+    }
+});
+
 app.MapControllers();
 
 app.Run();
@@ -2527,6 +2749,21 @@ internal record CheckoutOfflineSettleRequest(
     string? IdempotencyKey,
     string? PaymentMode,
     CheckoutOrderPayload? Order);
+
+internal record PrintLogFinalRequest(
+    string? DedupeKey,
+    int OrderId,
+    string? Station,
+    string? FinalStatus,
+    string? DeviceId,
+    string? AppVersion,
+    string? PrinterHost,
+    int? PrinterPort,
+    DateTime? StartedAt,
+    DateTime? FinishedAt,
+    int? TotalDurationMs,
+    int AttemptCount = 0,
+    JsonElement? AttemptsJson = null);
 
 internal record CheckoutOrderPayload(
     int MiniAppId,
