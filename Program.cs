@@ -1111,11 +1111,19 @@ SET
     Metadata = JSON_MODIFY(
         JSON_MODIFY(
             JSON_MODIFY(
-                JSON_MODIFY(CASE WHEN Metadata IS NULL OR ISJSON(Metadata) <> 1 THEN '{}' ELSE Metadata END,
-                    '$.checkout.state', @CheckoutState),
-                '$.checkout.submitState', @SubmitState),
-            '$.checkout.referenceNumber', @PaymentReference),
-        '$.checkout.transactionId', @TransactionId),
+                JSON_MODIFY(
+                    JSON_MODIFY(
+                        JSON_MODIFY(
+                            JSON_MODIFY(
+                                JSON_MODIFY(
+                                    JSON_MODIFY(CASE WHEN Metadata IS NULL OR ISJSON(Metadata) <> 1 THEN '{}' ELSE Metadata END,
+                                        '$.checkout.state', @CheckoutState),
+                                    '$.checkout.submitState', @SubmitState),
+                                '$.checkout.referenceNumber', @PaymentReference),
+                            '$.checkout.transactionId', @TransactionId),
+                        '$.checkout.returnCode', @ReturnCode),
+                    '$.checkout.returnMessage', @ReturnMessage),
+                '$.checkout.updatedAtUtc', @UpdatedAtUtc),
     UpdatedAt = SYSUTCDATETIME()
 WHERE Id = @Id;
 """;
@@ -1129,6 +1137,9 @@ WHERE Id = @Id;
         update.Parameters.AddWithValue("@CheckoutState", gatewayResult.CheckoutState);
         update.Parameters.AddWithValue("@SubmitState", submitState);
         update.Parameters.AddWithValue("@TransactionId", (object?)gatewayResult.TransactionId ?? DBNull.Value);
+        update.Parameters.AddWithValue("@ReturnCode", (object?)gatewayResult.ReturnCode ?? DBNull.Value);
+        update.Parameters.AddWithValue("@ReturnMessage", (object?)gatewayResult.ReturnMessage ?? DBNull.Value);
+        update.Parameters.AddWithValue("@UpdatedAtUtc", DateTime.UtcNow.ToString("O"));
         await update.ExecuteNonQueryAsync(ct);
 
         return gatewayResult.CheckoutState switch
