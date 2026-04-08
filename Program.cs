@@ -1220,7 +1220,7 @@ ORDER BY Id DESC;
         {
             var extractedOrder = SubmitOrderHelper.TryExtractOrder(metadataJson);
             var submitResult = extractedOrder is null
-                ? new SubmitOrderAttemptResult("failed", null, null, null, "Could not extract order payload from checkout metadata", DateTime.UtcNow)
+                ? new SubmitOrderAttemptResult("failed", null, null, null, "Could not extract order payload from checkout metadata", DateTime.UtcNow, null, null, null, null, null)
                 : await SubmitOrderHelper.SubmitAsync(
                     httpFactory,
                     config,
@@ -1321,7 +1321,7 @@ WHERE Id = @Id;
         {
             var extractedOrder = SubmitOrderHelper.TryExtractOrder(metadataJson);
             var submitResult = extractedOrder is null
-                ? new SubmitOrderAttemptResult("failed", null, null, null, "Could not extract order payload from checkout metadata", DateTime.UtcNow)
+                ? new SubmitOrderAttemptResult("failed", null, null, null, "Could not extract order payload from checkout metadata", DateTime.UtcNow, null, null, null, null, null)
                 : await SubmitOrderHelper.SubmitAsync(
                     httpFactory,
                     config,
@@ -1710,7 +1710,12 @@ internal record SubmitOrderAttemptResult(
     bool? Replay,
     int? HttpStatus,
     string? Error,
-    DateTime AttemptedAtUtc);
+    DateTime AttemptedAtUtc,
+    string? RequestPayloadJson,
+    string? SubmitUrl,
+    string? ResponseBody,
+    string? ResponseReasonPhrase,
+    Dictionary<string, string[]>? ResponseHeaders);
 
 internal interface IZcreditGateway
 {
@@ -1761,6 +1766,38 @@ internal static class SubmitOrderHelper
         submitNode["httpStatus"] = result.HttpStatus;
         submitNode["error"] = result.Error;
         submitNode["attemptedAtUtc"] = result.AttemptedAtUtc.ToString("O");
+        submitNode["url"] = result.SubmitUrl;
+        submitNode["responseBody"] = result.ResponseBody;
+        submitNode["responseReasonPhrase"] = result.ResponseReasonPhrase;
+
+        if (!string.IsNullOrWhiteSpace(result.RequestPayloadJson))
+        {
+            try
+            {
+                submitNode["requestPayload"] = JsonNode.Parse(result.RequestPayloadJson);
+            }
+            catch
+            {
+                submitNode["requestPayload"] = result.RequestPayloadJson;
+            }
+        }
+
+        if (result.ResponseHeaders is { Count: > 0 })
+        {
+            var headersNode = new JsonObject();
+            foreach (var (key, values) in result.ResponseHeaders)
+            {
+                var array = new JsonArray();
+                foreach (var value in values)
+                {
+                    array.Add(value);
+                }
+
+                headersNode[key] = array;
+            }
+
+            submitNode["responseHeaders"] = headersNode;
+        }
     }
 
     public static async Task<SubmitOrderAttemptResult> SubmitAsync(
@@ -1784,7 +1821,7 @@ internal static class SubmitOrderHelper
 
         if (mode == "off")
         {
-            return new SubmitOrderAttemptResult("not_started", null, null, null, null, attemptedAtUtc);
+            return new SubmitOrderAttemptResult("not_started", null, null, null, null, attemptedAtUtc, null, null, null, null, null);
         }
 
         if (mode == "fake")
@@ -1792,19 +1829,20 @@ internal static class SubmitOrderHelper
             log.LogInformation(
                 "Fake submitOrder miniAppId={MiniAppId} checkoutOrderId={CheckoutOrderId} idem={Idem}",
                 miniAppId, checkoutOrderId, idempotencyKey);
-            return new SubmitOrderAttemptResult("done", checkoutOrderId + 500000, false, 200, null, attemptedAtUtc);
+            return new SubmitOrderAttemptResult("done", checkoutOrderId + 500000, false, 200, null, attemptedAtUtc, null, null, null, "OK", null);
         }
 
         var url = (config["CheckoutDebug:SubmitOrderUrl"] ?? "https://minis.studio/submitOrder").Trim();
         if (string.IsNullOrWhiteSpace(url))
         {
-            return new SubmitOrderAttemptResult("failed", null, null, null, "Missing CheckoutDebug:SubmitOrderUrl", attemptedAtUtc);
+            return new SubmitOrderAttemptResult("failed", null, null, null, "Missing CheckoutDebug:SubmitOrderUrl", attemptedAtUtc, null, url, null, null, null);
         }
 
         var payload = BuildSubmitPayload(order, miniAppId, amount, currency, idempotencyKey, pinpadId, transactionType, gatewayResult);
+        var payloadJson = payload.ToJsonString();
         using var req = new HttpRequestMessage(HttpMethod.Post, url)
         {
-            Content = new StringContent(payload.ToJsonString(), System.Text.Encoding.UTF8, "application/json")
+            Content = new StringContent(payloadJson, System.Text.Encoding.UTF8, "application/json")
         };
         var source = NormalizeSource(order.Source);
         req.Headers.TryAddWithoutValidation("Idempotency-Key", idempotencyKey);
@@ -1817,13 +1855,21 @@ internal static class SubmitOrderHelper
             client.Timeout = TimeSpan.FromSeconds(30);
             using var response = await client.SendAsync(req, ct);
             var body = await response.Content.ReadAsStringAsync(ct);
+            var headerMap = response.Headers
+                .Concat(response.Content.Headers)
+                .GroupBy(h => h.Key, StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(g => g.Key, g => g.SelectMany(v => v.Value).ToArray(), StringComparer.OrdinalIgnoreCase);
+            var reasonPhrase = response.ReasonPhrase;
 
             if (!response.IsSuccessStatusCode)
             {
+                var errorText = !string.IsNullOrWhiteSpace(body)
+                    ? body
+                    : $"submitOrder HTTP {(int)response.StatusCode} {reasonPhrase ?? "Unknown"} with empty body";
                 log.LogWarning(
-                    "submitOrder failed miniAppId={MiniAppId} checkoutOrderId={CheckoutOrderId} status={Status}",
-                    miniAppId, checkoutOrderId, (int)response.StatusCode);
-                return new SubmitOrderAttemptResult("failed", null, null, (int)response.StatusCode, body, attemptedAtUtc);
+                    "submitOrder failed miniAppId={MiniAppId} checkoutOrderId={CheckoutOrderId} status={Status} reason={Reason} body={Body}",
+                    miniAppId, checkoutOrderId, (int)response.StatusCode, reasonPhrase, string.IsNullOrWhiteSpace(body) ? "<empty>" : body);
+                return new SubmitOrderAttemptResult("failed", null, null, (int)response.StatusCode, errorText, attemptedAtUtc, payloadJson, url, body, reasonPhrase, headerMap);
             }
 
             int? submittedOrderId = null;
@@ -1848,15 +1894,15 @@ internal static class SubmitOrderHelper
             }
 
             return submittedOrderId.HasValue && submittedOrderId.Value > 0
-                ? new SubmitOrderAttemptResult("done", submittedOrderId, replay, (int)response.StatusCode, null, attemptedAtUtc)
-                : new SubmitOrderAttemptResult("failed", null, replay, (int)response.StatusCode, "submitOrder succeeded but returned no orderId", attemptedAtUtc);
+                ? new SubmitOrderAttemptResult("done", submittedOrderId, replay, (int)response.StatusCode, null, attemptedAtUtc, payloadJson, url, body, reasonPhrase, headerMap)
+                : new SubmitOrderAttemptResult("failed", null, replay, (int)response.StatusCode, "submitOrder succeeded but returned no orderId", attemptedAtUtc, payloadJson, url, body, reasonPhrase, headerMap);
         }
         catch (Exception ex)
         {
             log.LogError(ex,
                 "submitOrder exception miniAppId={MiniAppId} checkoutOrderId={CheckoutOrderId}",
                 miniAppId, checkoutOrderId);
-            return new SubmitOrderAttemptResult("failed", null, null, null, ex.Message, attemptedAtUtc);
+            return new SubmitOrderAttemptResult("failed", null, null, null, ex.Message, attemptedAtUtc, payloadJson, url, null, null, null);
         }
     }
 
