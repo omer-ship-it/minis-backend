@@ -202,6 +202,8 @@ app.MapPost("/checkout/zcredit/card", async (
     ILogger<Program> log,
     CancellationToken ct) =>
 {
+    try
+    {
     static decimal R2(decimal value) => Math.Round(value, 2, MidpointRounding.AwayFromZero);
 
     static string NormalizeIdempotency(string? raw) =>
@@ -417,6 +419,7 @@ INSERT INTO dbo.Orders
     Source,
     PaymentMethod,
     TicketNumber,
+    AutoPrintEligible,
     IdempotencyKeyRaw
 )
 VALUES
@@ -431,6 +434,7 @@ VALUES
     @Source,
     'unpaid',
     NULL,
+    0,
     @IdempotencyKey
 );
 SELECT CAST(SCOPE_IDENTITY() AS int);
@@ -487,6 +491,8 @@ SET
     Total = @Total,
     Status = @Status,
     PaymentMethod = @PaymentMethod,
+    PaymentReference = @PaymentReference,
+    PaymentApprovedAtUtc = @PaymentApprovedAtUtc,
     Metadata = @Metadata,
     UpdatedAt = SYSUTCDATETIME()
 WHERE Id = @Id;
@@ -497,6 +503,11 @@ WHERE Id = @Id;
         cmd.Parameters.AddWithValue("@Total", amount);
         cmd.Parameters.AddWithValue("@Status", checkoutState == "paid" ? 1 : 0);
         cmd.Parameters.AddWithValue("@PaymentMethod", checkoutState == "paid" ? "card" : "unpaid");
+        cmd.Parameters.AddWithValue("@PaymentReference", (object?)referenceNumber ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("@PaymentApprovedAtUtc",
+            checkoutState == "paid"
+                ? DateTime.UtcNow
+                : DBNull.Value);
         cmd.Parameters.AddWithValue("@Metadata", metadataJson);
         await cmd.ExecuteNonQueryAsync(token);
     }
@@ -766,6 +777,18 @@ WHERE Id = @Id;
 
             return await RunMemoryCheckoutAsync(memoryCheckoutStore, miniAppId, idempotencyKey, amount, currency, req, traceId, storageWarning, ct);
         }
+    }
+    }
+    catch (Exception ex)
+    {
+        log.LogError(ex, "Checkout debug endpoint failed trace={Trace}", ctx.TraceIdentifier);
+        return Results.Json(new
+        {
+            ok = false,
+            error = ex.Message,
+            type = ex.GetType().FullName,
+            traceId = ctx.TraceIdentifier
+        }, statusCode: 500);
     }
 });
 
