@@ -213,8 +213,7 @@ app.MapPost("/checkout/zcredit/card", async (
 
     static string NormalizeSource(string? raw)
     {
-        var value = string.IsNullOrWhiteSpace(raw) ? "mini" : raw.Trim();
-        return value.Length <= 20 ? value : value[..20];
+        return "cashpoint";
     }
 
     static string ResolveSubmitMode(IConfiguration cfg, IHostEnvironment env)
@@ -1930,8 +1929,7 @@ internal static class SubmitOrderHelper
 
     private static string NormalizeSource(string? raw)
     {
-        var value = string.IsNullOrWhiteSpace(raw) ? "mini" : raw.Trim();
-        return value.Length <= 20 ? value : value[..20];
+        return "cashpoint";
     }
 
     private static string InferService(string? diningMode)
