@@ -1115,15 +1115,14 @@ SET
                     JSON_MODIFY(
                         JSON_MODIFY(
                             JSON_MODIFY(
-                                JSON_MODIFY(
-                                    JSON_MODIFY(CASE WHEN Metadata IS NULL OR ISJSON(Metadata) <> 1 THEN '{}' ELSE Metadata END,
-                                        '$.checkout.state', @CheckoutState),
-                                    '$.checkout.submitState', @SubmitState),
-                                '$.checkout.referenceNumber', @PaymentReference),
-                            '$.checkout.transactionId', @TransactionId),
+                                JSON_MODIFY(CASE WHEN Metadata IS NULL OR ISJSON(Metadata) <> 1 THEN '{}' ELSE Metadata END,
+                                    '$.checkout.state', @CheckoutState),
+                                '$.checkout.submitState', @SubmitState),
+                            '$.checkout.referenceNumber', @PaymentReference),
+                        '$.checkout.transactionId', @TransactionId),
                         '$.checkout.returnCode', @ReturnCode),
                     '$.checkout.returnMessage', @ReturnMessage),
-                '$.checkout.updatedAtUtc', @UpdatedAtUtc)),
+                '$.checkout.updatedAtUtc', @UpdatedAtUtc),
     UpdatedAt = SYSUTCDATETIME()
 WHERE Id = @Id;
 """;
