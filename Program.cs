@@ -415,7 +415,7 @@ ORDER BY Id DESC;
         string transactionType,
         CancellationToken token)
     {
-        var orderSource = string.IsNullOrWhiteSpace(order.Source) ? "mini-zcredit-card-debug" : order.Source.Trim();
+        var orderSource = NormalizeSource(order.Source);
         var metadataJson = BuildMetadataJson(
             request,
             order,
@@ -501,7 +501,7 @@ SELECT CAST(SCOPE_IDENTITY() AS int);
         DateTime? submitAttemptedAtUtc,
         CancellationToken token)
     {
-        var orderSource = string.IsNullOrWhiteSpace(order.Source) ? "mini-zcredit-card-debug" : order.Source.Trim();
+        var orderSource = NormalizeSource(order.Source);
         var metadataJson = BuildMetadataJson(
             request,
             order,
