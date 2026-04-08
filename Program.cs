@@ -1123,7 +1123,7 @@ SET
                             '$.checkout.transactionId', @TransactionId),
                         '$.checkout.returnCode', @ReturnCode),
                     '$.checkout.returnMessage', @ReturnMessage),
-                '$.checkout.updatedAtUtc', @UpdatedAtUtc),
+                '$.checkout.updatedAtUtc', @UpdatedAtUtc)),
     UpdatedAt = SYSUTCDATETIME()
 WHERE Id = @Id;
 """;
