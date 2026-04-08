@@ -1636,6 +1636,7 @@ ORDER BY Id DESC;
                     provider = "offline",
                     method = paymentMode,
                     state = checkoutState,
+                    initialState = checkoutState,
                     submitState,
                     amount,
                     currency,
@@ -2287,6 +2288,13 @@ WHERE Id = @Id
         metadataNode["checkout"] = checkoutNode;
         checkoutNode["provider"] = "offline";
         checkoutNode["method"] = "cash";
+        if (checkoutNode["initialState"] is null)
+        {
+            checkoutNode["initialState"] = existing.Checkout.State;
+        }
+        checkoutNode["settledFrom"] = existing.Checkout.State;
+        checkoutNode["previousPaymentMethod"] = existing.PaymentMethod;
+        checkoutNode["settledAtUtc"] = DateTime.UtcNow.ToString("O");
         checkoutNode["state"] = "paid";
         checkoutNode["submitState"] = existing.Checkout.SubmitState;
         checkoutNode["amount"] = existing.Amount;
@@ -2899,6 +2907,12 @@ internal static class SubmitOrderHelper
         int? existingSubmittedOrderId)
     {
         var source = NormalizeSource(order.Source);
+        var paymentNode = CloneNode(order.Payment) as JsonObject;
+        var paymentProvider = paymentNode?["provider"]?.GetValue<string?>();
+        var paymentMethod = paymentNode?["method"]?.GetValue<string?>();
+        var isCardPayment =
+            string.Equals(paymentMethod, "card", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(paymentProvider, "zcredit", StringComparison.OrdinalIgnoreCase);
         var payload = new JsonObject
         {
             ["uuid"] = string.IsNullOrWhiteSpace(order.UUID) ? Guid.NewGuid().ToString() : order.UUID,
@@ -2918,14 +2932,18 @@ internal static class SubmitOrderHelper
                 ["discount"] = 0,
                 ["currency"] = currency
             },
-            ["payment"] = CloneNode(order.Payment) ?? new JsonObject
+            ["payment"] = paymentNode ?? new JsonObject
             {
                 ["provider"] = "zcredit",
                 ["method"] = "card",
                 ["cardAmount"] = amount,
                 ["cashAmount"] = 0
-            },
-            ["zcredit"] = new JsonObject
+            }
+        };
+
+        if (isCardPayment)
+        {
+            payload["zcredit"] = new JsonObject
             {
                 ["provider"] = "zcredit",
                 ["method"] = "card",
@@ -2935,8 +2953,34 @@ internal static class SubmitOrderHelper
                 ["returnMessage"] = gatewayResult.ReturnMessage,
                 ["pinpadId"] = pinpadId,
                 ["transactionType"] = transactionType
+            };
+        }
+        else
+        {
+            payload["paymentResult"] = new JsonObject
+            {
+                ["provider"] = string.IsNullOrWhiteSpace(paymentProvider) ? "minis" : paymentProvider,
+                ["method"] = string.IsNullOrWhiteSpace(paymentMethod) ? "unpaid" : paymentMethod,
+                ["referenceNumber"] = gatewayResult.ReferenceNumber,
+                ["transactionId"] = gatewayResult.TransactionId,
+                ["returnCode"] = gatewayResult.ReturnCode,
+                ["returnMessage"] = gatewayResult.ReturnMessage,
+                ["pinpadId"] = pinpadId,
+                ["transactionType"] = transactionType
+            };
+
+            if (existingSubmittedOrderId.HasValue && existingSubmittedOrderId.Value > 0 &&
+                string.Equals(paymentMethod, "cash", StringComparison.OrdinalIgnoreCase))
+            {
+                payload["settlement"] = new JsonObject
+                {
+                    ["fromState"] = "pay_later",
+                    ["toState"] = "paid",
+                    ["previousPaymentMethod"] = "unpaid",
+                    ["completedAtUtc"] = DateTime.UtcNow.ToString("O")
+                };
             }
-        };
+        }
 
         if (existingSubmittedOrderId.HasValue && existingSubmittedOrderId.Value > 0)
         {
