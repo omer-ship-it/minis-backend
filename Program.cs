@@ -209,17 +209,10 @@ app.MapPost("/checkout/zcredit/card", async (
     static string NormalizeIdempotency(string? raw) =>
         string.IsNullOrWhiteSpace(raw) ? Guid.NewGuid().ToString("N") : raw.Trim();
 
-    static string NormalizeState(string? raw)
+    static string NormalizeSource(string? raw)
     {
-        var value = (raw ?? "").Trim().ToLowerInvariant();
-        return value switch
-        {
-            "approved" => "approved",
-            "declined" => "declined",
-            "pending" => "pending",
-            "unknown" => "unknown",
-            _ => "approved"
-        };
+        var value = string.IsNullOrWhiteSpace(raw) ? "mini" : raw.Trim();
+        return value.Length <= 20 ? value : value[..20];
     }
 
     static string? ResolveWriteConnectionString(IConfiguration cfg) =>
@@ -265,6 +258,7 @@ SELECT TOP (1)
     UpdatedAt,
     ISNULL(CAST(Metadata AS nvarchar(max)), '{}') AS MetadataJson,
     JSON_VALUE(Metadata, '$.checkout.state') AS CheckoutState,
+    JSON_VALUE(Metadata, '$.checkout.submitState') AS SubmitState,
     JSON_VALUE(Metadata, '$.checkout.referenceNumber') AS ReferenceNumber,
     JSON_VALUE(Metadata, '$.checkout.transactionId') AS TransactionId,
     JSON_VALUE(Metadata, '$.checkout.returnCode') AS ReturnCode,
@@ -296,6 +290,7 @@ ORDER BY Id DESC;
             MetadataJson: reader.GetString(reader.GetOrdinal("MetadataJson")),
             Checkout: new DbCheckoutState(
                 State: reader.IsDBNull(reader.GetOrdinal("CheckoutState")) ? "unknown" : reader.GetString(reader.GetOrdinal("CheckoutState")),
+                SubmitState: reader.IsDBNull(reader.GetOrdinal("SubmitState")) ? "not_started" : reader.GetString(reader.GetOrdinal("SubmitState")),
                 ReferenceNumber: reader.IsDBNull(reader.GetOrdinal("ReferenceNumber")) ? null : reader.GetString(reader.GetOrdinal("ReferenceNumber")),
                 TransactionId: reader.IsDBNull(reader.GetOrdinal("TransactionId")) ? null : reader.GetString(reader.GetOrdinal("TransactionId")),
                 ReturnCode: reader.IsDBNull(reader.GetOrdinal("ReturnCode")) ? null : reader.GetString(reader.GetOrdinal("ReturnCode")),
@@ -311,6 +306,7 @@ ORDER BY Id DESC;
         status = order.Status,
         paymentMethod = order.PaymentMethod,
         checkoutState = order.Checkout.State,
+        submitState = order.Checkout.SubmitState,
         referenceNumber = order.Checkout.ReferenceNumber,
         transactionId = order.Checkout.TransactionId,
         traceId,
@@ -327,6 +323,7 @@ ORDER BY Id DESC;
         status = order.Status,
         paymentMethod = order.PaymentMethod,
         checkoutState = order.Checkout.State,
+        submitState = order.Checkout.SubmitState,
         referenceNumber = order.Checkout.ReferenceNumber,
         transactionId = order.Checkout.TransactionId,
         traceId,
@@ -344,6 +341,7 @@ ORDER BY Id DESC;
         string currency,
         string transactionType,
         string checkoutState,
+        string submitState,
         string? referenceNumber,
         string? transactionId,
         string? returnCode,
@@ -363,6 +361,7 @@ ORDER BY Id DESC;
                 provider = "zcredit",
                 method = "card",
                 state = checkoutState,
+                submitState,
                 amount,
                 currency,
                 transactionType,
@@ -401,6 +400,7 @@ ORDER BY Id DESC;
             currency,
             transactionType,
             checkoutState: "pending",
+            submitState: "not_started",
             referenceNumber: null,
             transactionId: null,
             returnCode: null,
@@ -463,6 +463,7 @@ SELECT CAST(SCOPE_IDENTITY() AS int);
         string currency,
         string transactionType,
         string checkoutState,
+        string submitState,
         string? referenceNumber,
         string? transactionId,
         string? returnCode,
@@ -480,6 +481,7 @@ SELECT CAST(SCOPE_IDENTITY() AS int);
             currency,
             transactionType,
             checkoutState,
+            submitState,
             referenceNumber,
             transactionId,
             returnCode,
@@ -529,6 +531,11 @@ WHERE Id = @Id;
         return Results.BadRequest(new { ok = false, error = "amount must be > 0", traceId = ctx.TraceIdentifier });
     }
 
+    if (!req.Order.CustomerId.HasValue || req.Order.CustomerId.Value <= 0)
+    {
+        return Results.BadRequest(new { ok = false, error = "order.customerId is required", traceId = ctx.TraceIdentifier });
+    }
+
     string? Corr(string key) =>
         ctx.Request.Headers.TryGetValue(key, out var value) && !string.IsNullOrWhiteSpace(value)
             ? value.ToString()
@@ -545,6 +552,8 @@ WHERE Id = @Id;
     var currency = string.IsNullOrWhiteSpace(req.Currency) ? "ILS" : req.Currency.Trim().ToUpperInvariant();
     var transactionType = string.IsNullOrWhiteSpace(req.TransactionType) ? "01" : req.TransactionType.Trim();
     var allowMemoryFallback = AllowMemoryFallback(config, app.Environment);
+    var normalizedOrder = req.Order with { Source = NormalizeSource(req.Order.Source) };
+    var gateway = ZcreditGatewayFactory.Create(config, log);
 
     SqlConnection? conn = null;
     string? storageWarning = null;
@@ -594,7 +603,7 @@ WHERE Id = @Id;
             PaymentMethod: "unpaid",
             CreatedAtUtc: createdAtUtc,
             UpdatedAtUtc: createdAtUtc,
-            Checkout: new MemoryCheckoutState("pending", null, null, null, null));
+            Checkout: new MemoryCheckoutState("pending", "not_started", null, null, null, null));
 
         if (!store.TryAdd(memoryKey, pendingMemory))
         {
@@ -609,44 +618,32 @@ WHERE Id = @Id;
 
         await Task.Delay(TimeSpan.FromMilliseconds(150), token);
 
-        var simulatedOutcome = NormalizeState(req.DebugOutcome);
-        var referenceNumber = simulatedOutcome == "approved" ? $"REF-{memoryOrderId}" : null;
-        var transactionId = simulatedOutcome == "approved" ? $"TX-{memoryOrderId}" : null;
-        var returnCode = simulatedOutcome switch
-        {
-            "approved" => "0",
-            "declined" => "1001",
-            "pending" => "-80",
-            "unknown" => "CommitHttpError",
-            _ => "0"
-        };
-        var returnMessage = simulatedOutcome switch
-        {
-            "approved" => "Approved",
-            "declined" => "Declined",
-            "pending" => "Pending confirmation",
-            "unknown" => "Gateway response unknown",
-            _ => "Approved"
-        };
-        var finalState = simulatedOutcome switch
-        {
-            "approved" => "paid",
-            "declined" => "declined",
-            "pending" => "pending",
-            "unknown" => "unknown",
-            _ => "paid"
-        };
+        var gatewayResult = await gateway.CommitAsync(new GatewayCommitRequest(
+            MiniAppId: miniAppId,
+            OrderId: memoryOrderId,
+            Amount: amount,
+            Currency: currency,
+            IdempotencyKey: idempotencyKey,
+            TransactionType: transactionType,
+            PinpadId: req.PinpadId,
+            DebugOutcome: req.DebugOutcome), token);
 
         var finalMemory = pendingMemory with
         {
-            Status = finalState == "paid" ? 1 : 0,
-            PaymentMethod = finalState == "paid" ? "card" : "unpaid",
+            Status = gatewayResult.CheckoutState == "paid" ? 1 : 0,
+            PaymentMethod = gatewayResult.CheckoutState == "paid" ? "card" : "unpaid",
             UpdatedAtUtc = DateTime.UtcNow,
-            Checkout = new MemoryCheckoutState(finalState, referenceNumber, transactionId, returnCode, returnMessage)
+            Checkout = new MemoryCheckoutState(
+                gatewayResult.CheckoutState,
+                "not_started",
+                gatewayResult.ReferenceNumber,
+                gatewayResult.TransactionId,
+                gatewayResult.ReturnCode,
+                gatewayResult.ReturnMessage)
         };
         store[memoryKey] = finalMemory;
 
-        return finalState switch
+        return gatewayResult.CheckoutState switch
         {
             "paid" => Results.Ok(BuildMemoryCheckoutResponse(finalMemory, replay: false, traceId, "memory", storageWarning)),
             "declined" => Results.Json(BuildMemoryCheckoutResponse(finalMemory, replay: false, traceId, "memory", storageWarning), statusCode: 402),
@@ -687,7 +684,7 @@ WHERE Id = @Id;
         int orderId;
         try
         {
-            orderId = await InsertPendingOrderAsync(conn, req, order, miniAppId, idempotencyKey, amount, currency, transactionType, ct);
+            orderId = await InsertPendingOrderAsync(conn, req, normalizedOrder, miniAppId, idempotencyKey, amount, currency, transactionType, ct);
         }
         catch (SqlException ex) when (ex.Number is 2601 or 2627)
         {
@@ -708,50 +705,32 @@ WHERE Id = @Id;
 
         await Task.Delay(TimeSpan.FromMilliseconds(150), ct);
 
-        var simulatedOutcome = NormalizeState(req.DebugOutcome);
-        var referenceNumber = simulatedOutcome == "approved" ? $"REF-{orderId}" : null;
-        var transactionId = simulatedOutcome == "approved" ? $"TX-{orderId}" : null;
-        var returnCode = simulatedOutcome switch
-        {
-            "approved" => "0",
-            "declined" => "1001",
-            "pending" => "-80",
-            "unknown" => "CommitHttpError",
-            _ => "0"
-        };
-        var returnMessage = simulatedOutcome switch
-        {
-            "approved" => "Approved",
-            "declined" => "Declined",
-            "pending" => "Pending confirmation",
-            "unknown" => "Gateway response unknown",
-            _ => "Approved"
-        };
-
-        var finalState = simulatedOutcome switch
-        {
-            "approved" => "paid",
-            "declined" => "declined",
-            "pending" => "pending",
-            "unknown" => "unknown",
-            _ => "paid"
-        };
+        var gatewayResult = await gateway.CommitAsync(new GatewayCommitRequest(
+            MiniAppId: miniAppId,
+            OrderId: orderId,
+            Amount: amount,
+            Currency: currency,
+            IdempotencyKey: idempotencyKey,
+            TransactionType: transactionType,
+            PinpadId: req.PinpadId,
+            DebugOutcome: req.DebugOutcome), ct);
 
         await UpdateOrderAsync(
             conn,
             orderId,
             req,
-            order,
+            normalizedOrder,
             miniAppId,
             idempotencyKey,
             amount,
             currency,
             transactionType,
-            finalState,
-            referenceNumber,
-            transactionId,
-            returnCode,
-            returnMessage,
+            gatewayResult.CheckoutState,
+            "not_started",
+            gatewayResult.ReferenceNumber,
+            gatewayResult.TransactionId,
+            gatewayResult.ReturnCode,
+            gatewayResult.ReturnMessage,
             ct);
 
         var finalOrder = await FindExistingAsync(conn, miniAppId, idempotencyKey, ct)
@@ -759,9 +738,9 @@ WHERE Id = @Id;
 
         log.LogInformation(
             "Checkout finalized miniAppId={MiniAppId} idem={Idem} orderId={OrderId} state={State} rc={Code} trace={Trace}",
-            miniAppId, idempotencyKey, orderId, finalState, returnCode, traceId);
+            miniAppId, idempotencyKey, orderId, gatewayResult.CheckoutState, gatewayResult.ReturnCode, traceId);
 
-        return finalState switch
+        return gatewayResult.CheckoutState switch
         {
             "paid" => Results.Ok(BuildDbCheckoutResponse(finalOrder, replay: false, traceId, "sql")),
             "declined" => Results.Json(BuildDbCheckoutResponse(finalOrder, replay: false, traceId, "sql"), statusCode: 402),
@@ -782,6 +761,432 @@ WHERE Id = @Id;
     catch (Exception ex)
     {
         log.LogError(ex, "Checkout debug endpoint failed trace={Trace}", ctx.TraceIdentifier);
+        return Results.Json(new
+        {
+            ok = false,
+            error = ex.Message,
+            type = ex.GetType().FullName,
+            traceId = ctx.TraceIdentifier
+        }, statusCode: 500);
+    }
+});
+
+app.MapPost("/checkout/zcredit/card/reconcile", async (
+    CheckoutReconcileRequest req,
+    IConfiguration config,
+    HttpContext ctx,
+    ILogger<Program> log,
+    CancellationToken ct) =>
+{
+    try
+    {
+        static string? ResolveWriteConnectionString(IConfiguration cfg) =>
+            cfg.GetConnectionString("DefaultConnection")
+            ?? Environment.GetEnvironmentVariable("SQL_CONNECTION");
+
+        static bool AllowMemoryFallback(IConfiguration cfg, IHostEnvironment env)
+        {
+            var configured = cfg["CheckoutDebug:AllowMemoryFallback"];
+            if (!string.IsNullOrWhiteSpace(configured) && bool.TryParse(configured, out var parsed))
+            {
+                return parsed;
+            }
+
+            return env.IsDevelopment();
+        }
+
+        static string BuildMemoryKey(int miniAppId, string idempotencyKey) => $"{miniAppId}:{idempotencyKey}";
+
+        if (req.MiniAppId <= 0 || string.IsNullOrWhiteSpace(req.IdempotencyKey))
+        {
+            return Results.BadRequest(new { ok = false, error = "miniAppId and idempotencyKey are required", traceId = ctx.TraceIdentifier });
+        }
+
+        var allowMemoryFallback = AllowMemoryFallback(config, app.Environment);
+        var idempotencyKey = req.IdempotencyKey.Trim();
+
+        SqlConnection? conn = null;
+        string? storageWarning = null;
+        try
+        {
+            var connectionString = ResolveWriteConnectionString(config);
+            if (string.IsNullOrWhiteSpace(connectionString))
+            {
+                throw new InvalidOperationException("Missing write connection string. Set ConnectionStrings:DefaultConnection or SQL_CONNECTION.");
+            }
+
+            conn = new SqlConnection(connectionString);
+            await conn.OpenAsync(ct);
+        }
+        catch (Exception ex) when (allowMemoryFallback)
+        {
+            storageWarning = $"SQL unavailable, using memory fallback: {ex.Message}";
+            log.LogWarning(ex,
+                "Checkout reconcile SQL unavailable, falling back to memory miniAppId={MiniAppId} idem={Idem} trace={Trace}",
+                req.MiniAppId, idempotencyKey, ctx.TraceIdentifier);
+        }
+
+        if (conn is null)
+        {
+            var memoryKey = BuildMemoryKey(req.MiniAppId, idempotencyKey);
+            if (!memoryCheckoutStore.TryGetValue(memoryKey, out var memoryOrder))
+            {
+                return Results.NotFound(new { ok = false, error = "Order not found", traceId = ctx.TraceIdentifier, storageMode = "memory" });
+            }
+
+            if (memoryOrder.Checkout.State is "paid" or "declined")
+            {
+                return Results.Ok(new
+                {
+                    ok = memoryOrder.Checkout.State == "paid",
+                    replay = true,
+                    reconciled = false,
+                    orderId = memoryOrder.OrderId,
+                    payment = memoryOrder.Checkout.State,
+                    checkoutState = memoryOrder.Checkout.State,
+                    submitState = memoryOrder.Checkout.SubmitState,
+                    memoryOrder.Checkout.ReferenceNumber,
+                    memoryOrder.Checkout.TransactionId,
+                    traceId = ctx.TraceIdentifier,
+                    storageMode = "memory",
+                    storageWarning
+                });
+            }
+
+            var gateway = ZcreditGatewayFactory.Create(config, log);
+            var gatewayResult = await gateway.ReconcileAsync(new GatewayReconcileRequest(
+                MiniAppId: req.MiniAppId,
+                OrderId: memoryOrder.OrderId,
+                Amount: memoryOrder.Amount,
+                IdempotencyKey: idempotencyKey,
+                ReferenceNumber: memoryOrder.Checkout.ReferenceNumber,
+                TransactionId: memoryOrder.Checkout.TransactionId), ct);
+
+            var reconciled = memoryOrder with
+            {
+                Status = gatewayResult.CheckoutState == "paid" ? 1 : 0,
+                PaymentMethod = gatewayResult.CheckoutState == "paid" ? "card" : "unpaid",
+                UpdatedAtUtc = DateTime.UtcNow,
+                Checkout = memoryOrder.Checkout with
+                {
+                    State = gatewayResult.CheckoutState,
+                    ReferenceNumber = gatewayResult.ReferenceNumber ?? memoryOrder.Checkout.ReferenceNumber,
+                    TransactionId = gatewayResult.TransactionId ?? memoryOrder.Checkout.TransactionId,
+                    ReturnCode = gatewayResult.ReturnCode,
+                    ReturnMessage = gatewayResult.ReturnMessage
+                }
+            };
+            memoryCheckoutStore[memoryKey] = reconciled;
+
+            return gatewayResult.CheckoutState switch
+            {
+                "paid" => Results.Ok(new
+                {
+                    ok = true,
+                    reconciled = true,
+                    orderId = reconciled.OrderId,
+                    payment = reconciled.Checkout.State,
+                    checkoutState = reconciled.Checkout.State,
+                    submitState = reconciled.Checkout.SubmitState,
+                    reconciled.Checkout.ReferenceNumber,
+                    reconciled.Checkout.TransactionId,
+                    traceId = ctx.TraceIdentifier,
+                    storageMode = "memory",
+                    storageWarning
+                }),
+                "declined" => Results.Json(new
+                {
+                    ok = false,
+                    reconciled = true,
+                    orderId = reconciled.OrderId,
+                    payment = reconciled.Checkout.State,
+                    checkoutState = reconciled.Checkout.State,
+                    submitState = reconciled.Checkout.SubmitState,
+                    reconciled.Checkout.ReferenceNumber,
+                    reconciled.Checkout.TransactionId,
+                    traceId = ctx.TraceIdentifier,
+                    storageMode = "memory",
+                    storageWarning
+                }, statusCode: 402),
+                _ => Results.Json(new
+                {
+                    ok = false,
+                    reconciled = true,
+                    orderId = reconciled.OrderId,
+                    payment = reconciled.Checkout.State,
+                    checkoutState = reconciled.Checkout.State,
+                    submitState = reconciled.Checkout.SubmitState,
+                    reconciled.Checkout.ReferenceNumber,
+                    reconciled.Checkout.TransactionId,
+                    traceId = ctx.TraceIdentifier,
+                    storageMode = "memory",
+                    storageWarning
+                }, statusCode: 202)
+            };
+        }
+
+        async Task<IResult> RunMemoryReconcileAsync(string? warning)
+        {
+            var memoryKey = BuildMemoryKey(req.MiniAppId, idempotencyKey);
+            if (!memoryCheckoutStore.TryGetValue(memoryKey, out var memoryOrder))
+            {
+                return Results.NotFound(new { ok = false, error = "Order not found", traceId = ctx.TraceIdentifier, storageMode = "memory" });
+            }
+
+            if (memoryOrder.Checkout.State is "paid" or "declined")
+            {
+                return Results.Ok(new
+                {
+                    ok = memoryOrder.Checkout.State == "paid",
+                    replay = true,
+                    reconciled = false,
+                    orderId = memoryOrder.OrderId,
+                    payment = memoryOrder.Checkout.State,
+                    checkoutState = memoryOrder.Checkout.State,
+                    submitState = memoryOrder.Checkout.SubmitState,
+                    memoryOrder.Checkout.ReferenceNumber,
+                    memoryOrder.Checkout.TransactionId,
+                    traceId = ctx.TraceIdentifier,
+                    storageMode = "memory",
+                    storageWarning = warning
+                });
+            }
+
+            var gateway = ZcreditGatewayFactory.Create(config, log);
+            var gatewayResult = await gateway.ReconcileAsync(new GatewayReconcileRequest(
+                MiniAppId: req.MiniAppId,
+                OrderId: memoryOrder.OrderId,
+                Amount: memoryOrder.Amount,
+                IdempotencyKey: idempotencyKey,
+                ReferenceNumber: memoryOrder.Checkout.ReferenceNumber,
+                TransactionId: memoryOrder.Checkout.TransactionId), ct);
+
+            var reconciled = memoryOrder with
+            {
+                Status = gatewayResult.CheckoutState == "paid" ? 1 : 0,
+                PaymentMethod = gatewayResult.CheckoutState == "paid" ? "card" : "unpaid",
+                UpdatedAtUtc = DateTime.UtcNow,
+                Checkout = memoryOrder.Checkout with
+                {
+                    State = gatewayResult.CheckoutState,
+                    ReferenceNumber = gatewayResult.ReferenceNumber ?? memoryOrder.Checkout.ReferenceNumber,
+                    TransactionId = gatewayResult.TransactionId ?? memoryOrder.Checkout.TransactionId,
+                    ReturnCode = gatewayResult.ReturnCode,
+                    ReturnMessage = gatewayResult.ReturnMessage
+                }
+            };
+            memoryCheckoutStore[memoryKey] = reconciled;
+
+            return gatewayResult.CheckoutState switch
+            {
+                "paid" => Results.Ok(new
+                {
+                    ok = true,
+                    reconciled = true,
+                    orderId = reconciled.OrderId,
+                    payment = reconciled.Checkout.State,
+                    checkoutState = reconciled.Checkout.State,
+                    submitState = reconciled.Checkout.SubmitState,
+                    reconciled.Checkout.ReferenceNumber,
+                    reconciled.Checkout.TransactionId,
+                    traceId = ctx.TraceIdentifier,
+                    storageMode = "memory",
+                    storageWarning = warning
+                }),
+                "declined" => Results.Json(new
+                {
+                    ok = false,
+                    reconciled = true,
+                    orderId = reconciled.OrderId,
+                    payment = reconciled.Checkout.State,
+                    checkoutState = reconciled.Checkout.State,
+                    submitState = reconciled.Checkout.SubmitState,
+                    reconciled.Checkout.ReferenceNumber,
+                    reconciled.Checkout.TransactionId,
+                    traceId = ctx.TraceIdentifier,
+                    storageMode = "memory",
+                    storageWarning = warning
+                }, statusCode: 402),
+                _ => Results.Json(new
+                {
+                    ok = false,
+                    reconciled = true,
+                    orderId = reconciled.OrderId,
+                    payment = reconciled.Checkout.State,
+                    checkoutState = reconciled.Checkout.State,
+                    submitState = reconciled.Checkout.SubmitState,
+                    reconciled.Checkout.ReferenceNumber,
+                    reconciled.Checkout.TransactionId,
+                    traceId = ctx.TraceIdentifier,
+                    storageMode = "memory",
+                    storageWarning = warning
+                }, statusCode: 202)
+            };
+        }
+
+        if (conn is null)
+        {
+            return await RunMemoryReconcileAsync(storageWarning);
+        }
+
+        await using (conn)
+        {
+        try
+        {
+
+        const string findSql = """
+SELECT TOP (1)
+    Id,
+    MiniAppId,
+    Total,
+    Status,
+    ISNULL(PaymentMethod, 'unpaid') AS PaymentMethod,
+    CreatedAt,
+    UpdatedAt,
+    ISNULL(CAST(Metadata AS nvarchar(max)), '{}') AS MetadataJson,
+    JSON_VALUE(Metadata, '$.checkout.state') AS CheckoutState,
+    JSON_VALUE(Metadata, '$.checkout.submitState') AS SubmitState,
+    JSON_VALUE(Metadata, '$.checkout.referenceNumber') AS ReferenceNumber,
+    JSON_VALUE(Metadata, '$.checkout.transactionId') AS TransactionId,
+    JSON_VALUE(Metadata, '$.checkout.returnCode') AS ReturnCode,
+    JSON_VALUE(Metadata, '$.checkout.returnMessage') AS ReturnMessage
+FROM dbo.Orders
+WHERE MiniAppId = @MiniAppId
+  AND IdempotencyKeyRaw = @IdempotencyKey
+ORDER BY Id DESC;
+""";
+
+        await using var cmd = new SqlCommand(findSql, conn);
+        cmd.Parameters.AddWithValue("@MiniAppId", req.MiniAppId);
+        cmd.Parameters.AddWithValue("@IdempotencyKey", idempotencyKey);
+
+        await using var reader = await cmd.ExecuteReaderAsync(ct);
+        if (!await reader.ReadAsync(ct))
+        {
+            return Results.NotFound(new { ok = false, error = "Order not found", traceId = ctx.TraceIdentifier });
+        }
+
+        var orderId = reader.GetInt32(reader.GetOrdinal("Id"));
+        var amount = reader.GetDecimal(reader.GetOrdinal("Total"));
+        var state = reader.IsDBNull(reader.GetOrdinal("CheckoutState")) ? "unknown" : reader.GetString(reader.GetOrdinal("CheckoutState"));
+        var submitState = reader.IsDBNull(reader.GetOrdinal("SubmitState")) ? "not_started" : reader.GetString(reader.GetOrdinal("SubmitState"));
+        var referenceNumber = reader.IsDBNull(reader.GetOrdinal("ReferenceNumber")) ? null : reader.GetString(reader.GetOrdinal("ReferenceNumber"));
+        var transactionId = reader.IsDBNull(reader.GetOrdinal("TransactionId")) ? null : reader.GetString(reader.GetOrdinal("TransactionId"));
+        await reader.DisposeAsync();
+
+        if (state is "paid" or "declined")
+        {
+            return Results.Ok(new
+            {
+                ok = true,
+                replay = true,
+                reconciled = false,
+                orderId,
+                payment = state,
+                checkoutState = state,
+                submitState,
+                referenceNumber,
+                transactionId,
+                traceId = ctx.TraceIdentifier,
+                storageMode = "sql"
+            });
+        }
+
+        var gateway = ZcreditGatewayFactory.Create(config, log);
+        var gatewayResult = await gateway.ReconcileAsync(new GatewayReconcileRequest(
+            MiniAppId: req.MiniAppId,
+            OrderId: orderId,
+            Amount: amount,
+            IdempotencyKey: idempotencyKey,
+            ReferenceNumber: referenceNumber,
+            TransactionId: transactionId), ct);
+
+        const string updateSql = """
+UPDATE dbo.Orders
+SET
+    Status = @Status,
+    PaymentMethod = @PaymentMethod,
+    PaymentReference = @PaymentReference,
+    PaymentApprovedAtUtc = @PaymentApprovedAtUtc,
+    Metadata = JSON_MODIFY(
+        JSON_MODIFY(
+            JSON_MODIFY(
+                JSON_MODIFY(CASE WHEN Metadata IS NULL OR ISJSON(Metadata) <> 1 THEN '{}' ELSE Metadata END,
+                    '$.checkout.state', @CheckoutState),
+                '$.checkout.submitState', @SubmitState),
+            '$.checkout.referenceNumber', @PaymentReference),
+        '$.checkout.transactionId', @TransactionId),
+    UpdatedAt = SYSUTCDATETIME()
+WHERE Id = @Id;
+""";
+
+        await using var update = new SqlCommand(updateSql, conn);
+        update.Parameters.AddWithValue("@Id", orderId);
+        update.Parameters.AddWithValue("@Status", gatewayResult.CheckoutState == "paid" ? 1 : 0);
+        update.Parameters.AddWithValue("@PaymentMethod", gatewayResult.CheckoutState == "paid" ? "card" : "unpaid");
+        update.Parameters.AddWithValue("@PaymentReference", (object?)gatewayResult.ReferenceNumber ?? DBNull.Value);
+        update.Parameters.AddWithValue("@PaymentApprovedAtUtc", gatewayResult.CheckoutState == "paid" ? DateTime.UtcNow : DBNull.Value);
+        update.Parameters.AddWithValue("@CheckoutState", gatewayResult.CheckoutState);
+        update.Parameters.AddWithValue("@SubmitState", submitState);
+        update.Parameters.AddWithValue("@TransactionId", (object?)gatewayResult.TransactionId ?? DBNull.Value);
+        await update.ExecuteNonQueryAsync(ct);
+
+        return gatewayResult.CheckoutState switch
+        {
+            "paid" => Results.Ok(new
+            {
+                ok = true,
+                reconciled = true,
+                orderId,
+                payment = gatewayResult.CheckoutState,
+                checkoutState = gatewayResult.CheckoutState,
+                submitState,
+                gatewayResult.ReferenceNumber,
+                gatewayResult.TransactionId,
+                traceId = ctx.TraceIdentifier,
+                storageMode = "sql"
+            }),
+            "declined" => Results.Json(new
+            {
+                ok = false,
+                reconciled = true,
+                orderId,
+                payment = gatewayResult.CheckoutState,
+                checkoutState = gatewayResult.CheckoutState,
+                submitState,
+                gatewayResult.ReferenceNumber,
+                gatewayResult.TransactionId,
+                traceId = ctx.TraceIdentifier,
+                storageMode = "sql"
+            }, statusCode: 402),
+            _ => Results.Json(new
+            {
+                ok = false,
+                reconciled = true,
+                orderId,
+                payment = gatewayResult.CheckoutState,
+                checkoutState = gatewayResult.CheckoutState,
+                submitState,
+                gatewayResult.ReferenceNumber,
+                gatewayResult.TransactionId,
+                traceId = ctx.TraceIdentifier,
+                storageMode = "sql"
+            }, statusCode: 202)
+        };
+        }
+        catch (SqlException ex) when (allowMemoryFallback && ex.Number == 208)
+        {
+            storageWarning = $"SQL schema unavailable, using memory fallback: {ex.Message}";
+            log.LogWarning(ex,
+                "Checkout reconcile SQL schema missing, falling back to memory miniAppId={MiniAppId} idem={Idem} trace={Trace}",
+                req.MiniAppId, idempotencyKey, ctx.TraceIdentifier);
+            return await RunMemoryReconcileAsync(storageWarning);
+        }
+        }
+    }
+    catch (Exception ex)
+    {
+        log.LogError(ex, "Checkout reconcile failed trace={Trace}", ctx.TraceIdentifier);
         return Results.Json(new
         {
             ok = false,
@@ -931,6 +1336,10 @@ internal record CheckoutZcreditCardRequest(
     string? DebugOutcome,
     CheckoutOrderPayload? Order);
 
+internal record CheckoutReconcileRequest(
+    int MiniAppId,
+    string IdempotencyKey);
+
 internal record CheckoutOrderPayload(
     int MiniAppId,
     int? CustomerId,
@@ -961,6 +1370,7 @@ internal record DbCheckoutOrder(
 
 internal record DbCheckoutState(
     string State,
+    string SubmitState,
     string? ReferenceNumber,
     string? TransactionId,
     string? ReturnCode,
@@ -980,7 +1390,187 @@ internal record MemoryCheckoutOrder(
 
 internal record MemoryCheckoutState(
     string State,
+    string SubmitState,
     string? ReferenceNumber,
     string? TransactionId,
     string? ReturnCode,
     string? ReturnMessage);
+
+internal record GatewayCommitRequest(
+    int MiniAppId,
+    int OrderId,
+    decimal Amount,
+    string Currency,
+    string IdempotencyKey,
+    string TransactionType,
+    string? PinpadId,
+    string? DebugOutcome);
+
+internal record GatewayReconcileRequest(
+    int MiniAppId,
+    int OrderId,
+    decimal Amount,
+    string IdempotencyKey,
+    string? ReferenceNumber,
+    string? TransactionId);
+
+internal record GatewayResult(
+    string CheckoutState,
+    string? ReferenceNumber,
+    string? TransactionId,
+    string? ReturnCode,
+    string? ReturnMessage);
+
+internal interface IZcreditGateway
+{
+    Task<GatewayResult> CommitAsync(GatewayCommitRequest request, CancellationToken ct);
+    Task<GatewayResult> ReconcileAsync(GatewayReconcileRequest request, CancellationToken ct);
+}
+
+internal static class ZcreditGatewayFactory
+{
+    public static IZcreditGateway Create(IConfiguration config, ILogger log)
+    {
+        var mode = (config["CheckoutDebug:GatewayMode"] ?? "fake").Trim().ToLowerInvariant();
+        return mode == "real"
+            ? new RealZcreditGateway(config, log)
+            : new FakeZcreditGateway(log);
+    }
+}
+
+internal sealed class FakeZcreditGateway(ILogger log) : IZcreditGateway
+{
+    public Task<GatewayResult> CommitAsync(GatewayCommitRequest request, CancellationToken ct)
+    {
+        var outcome = NormalizeOutcome(request.DebugOutcome);
+        var result = BuildResult(outcome, request.OrderId);
+        log.LogInformation(
+            "Fake gateway commit miniAppId={MiniAppId} orderId={OrderId} idem={Idem} state={State}",
+            request.MiniAppId, request.OrderId, request.IdempotencyKey, result.CheckoutState);
+        return Task.FromResult(result);
+    }
+
+    public Task<GatewayResult> ReconcileAsync(GatewayReconcileRequest request, CancellationToken ct)
+    {
+        var result = request.ReferenceNumber is not null || request.TransactionId is not null
+            ? new GatewayResult("paid", request.ReferenceNumber, request.TransactionId, "0", "Reconciled from saved identifiers")
+            : new GatewayResult("unknown", null, null, "CommitHttpError", "No saved identifiers to reconcile");
+        log.LogInformation(
+            "Fake gateway reconcile miniAppId={MiniAppId} orderId={OrderId} idem={Idem} state={State}",
+            request.MiniAppId, request.OrderId, request.IdempotencyKey, result.CheckoutState);
+        return Task.FromResult(result);
+    }
+
+    private static string NormalizeOutcome(string? raw)
+    {
+        var value = (raw ?? "").Trim().ToLowerInvariant();
+        return value switch
+        {
+            "approved" => "approved",
+            "declined" => "declined",
+            "pending" => "pending",
+            "unknown" => "unknown",
+            _ => "approved"
+        };
+    }
+
+    private static GatewayResult BuildResult(string outcome, int orderId) =>
+        outcome switch
+        {
+            "approved" => new GatewayResult("paid", $"REF-{orderId}", $"TX-{orderId}", "0", "Approved"),
+            "declined" => new GatewayResult("declined", null, null, "1001", "Declined"),
+            "pending" => new GatewayResult("pending", $"REF-{orderId}", null, "-80", "Pending confirmation"),
+            "unknown" => new GatewayResult("unknown", null, null, "CommitHttpError", "Gateway response unknown"),
+            _ => new GatewayResult("paid", $"REF-{orderId}", $"TX-{orderId}", "0", "Approved")
+        };
+}
+
+internal sealed class RealZcreditGateway(IConfiguration config, ILogger log) : IZcreditGateway
+{
+    public async Task<GatewayResult> CommitAsync(GatewayCommitRequest request, CancellationToken ct)
+    {
+        // This is intentionally config-driven and conservative so we can finish the
+        // integration before we have the physical terminal in hand.
+        var baseUrl = config["ZCredit:BaseUrl"];
+        var terminal = config["ZCredit:TerminalNumber"];
+        var password = config["ZCredit:Password"];
+        var pinpad = string.IsNullOrWhiteSpace(request.PinpadId) ? config["ZCredit:PinpadId"] : request.PinpadId;
+
+        if (string.IsNullOrWhiteSpace(baseUrl) ||
+            string.IsNullOrWhiteSpace(terminal) ||
+            string.IsNullOrWhiteSpace(password) ||
+            string.IsNullOrWhiteSpace(pinpad))
+        {
+            throw new InvalidOperationException("Real gateway mode requires ZCredit:BaseUrl, TerminalNumber, Password, and PinpadId.");
+        }
+
+        using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
+        var payload = new
+        {
+            TerminalNumber = terminal,
+            Password = password,
+            TransactionSum = request.Amount,
+            Track2 = $"PINPAD{pinpad}",
+            TransactionUniqueID = request.IdempotencyKey,
+            UseAdvancedDuplicatesCheck = true,
+            CoinID = request.Currency == "ILS" ? "376" : request.Currency,
+            TransactionType = request.TransactionType
+        };
+
+        var response = await http.PostAsJsonAsync($"{baseUrl.TrimEnd('/')}/Transaction/CommitFullTransaction", payload, ct);
+        var text = await response.Content.ReadAsStringAsync(ct);
+
+        if (!response.IsSuccessStatusCode)
+        {
+            log.LogWarning("Real gateway commit http={Status} body={Body}", (int)response.StatusCode, text);
+            return new GatewayResult("unknown", null, null, $"HTTP{(int)response.StatusCode}", text);
+        }
+
+        using var doc = JsonDocument.Parse(text);
+        var root = doc.RootElement;
+        var returnCode = JsonFlex(root, "ReturnCode");
+        var returnMessage = JsonFlex(root, "ReturnMessage");
+        var referenceNumber = JsonFlex(root, "ReferenceNumber");
+        var transactionId = JsonFlex(root, "TransactionId");
+        var hasError = JsonBool(root, "HasError");
+        var isApproved = JsonBool(root, "IsApproved") || returnCode == "0";
+        var state = hasError
+            ? (returnCode is "-80" or "-50101" ? "pending" : "declined")
+            : (isApproved ? "paid" : "unknown");
+
+        return new GatewayResult(state, referenceNumber, transactionId, returnCode, returnMessage);
+    }
+
+    public Task<GatewayResult> ReconcileAsync(GatewayReconcileRequest request, CancellationToken ct)
+    {
+        if (!string.IsNullOrWhiteSpace(request.ReferenceNumber) || !string.IsNullOrWhiteSpace(request.TransactionId))
+        {
+            return Task.FromResult(new GatewayResult("paid", request.ReferenceNumber, request.TransactionId, "0", "Reconciled from saved payment identifiers"));
+        }
+
+        return Task.FromResult(new GatewayResult("unknown", null, null, "NoReference", "Missing reference for reconciliation"));
+    }
+
+    private static string? JsonFlex(JsonElement root, string name) =>
+        root.TryGetProperty(name, out var p)
+            ? p.ValueKind switch
+            {
+                JsonValueKind.String => p.GetString(),
+                JsonValueKind.Number => p.ToString(),
+                JsonValueKind.True => "true",
+                JsonValueKind.False => "false",
+                _ => p.ToString()
+            }
+            : null;
+
+    private static bool JsonBool(JsonElement root, string name) =>
+        root.TryGetProperty(name, out var p)
+            && p.ValueKind switch
+            {
+                JsonValueKind.True => true,
+                JsonValueKind.False => false,
+                JsonValueKind.Number => p.ToString() != "0",
+                JsonValueKind.String => bool.TryParse(p.GetString(), out var b) && b,
+                _ => false
+            };
+}
