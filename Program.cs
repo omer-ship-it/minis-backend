@@ -1,7 +1,6 @@
 using System.Collections.Concurrent;
 using System.Text.Json.Nodes;
 using System.Text.Json;
-using System.Text.Json.Serialization;
 using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.FileProviders;
 
@@ -1580,100 +1579,12 @@ internal record CheckoutOrderPayload(
     string? OrderType = null,
     string? TabKey = null);
 
-internal sealed class CheckoutBasketItem
-{
-    [JsonNumberHandling(JsonNumberHandling.AllowReadingFromString)]
-    public int? ProductId { get; init; }
-
-    public string? Name { get; init; }
-
-    [JsonNumberHandling(JsonNumberHandling.AllowReadingFromString)]
-    public int Quantity { get; init; }
-
-    [JsonNumberHandling(JsonNumberHandling.AllowReadingFromString)]
-    public decimal Price { get; init; }
-
-    [JsonNumberHandling(JsonNumberHandling.AllowReadingFromString)]
-    public decimal? UnitPrice { get; init; }
-
-    [JsonNumberHandling(JsonNumberHandling.AllowReadingFromString)]
-    public decimal? UnitTotalPrice { get; init; }
-
-    [JsonNumberHandling(JsonNumberHandling.AllowReadingFromString)]
-    public decimal? LineTotal { get; init; }
-
-    [JsonNumberHandling(JsonNumberHandling.AllowReadingFromString)]
-    public decimal? UnitBasePrice { get; init; }
-
-    [JsonNumberHandling(JsonNumberHandling.AllowReadingFromString)]
-    public decimal? UnitExtraPrice { get; init; }
-
-    [JsonNumberHandling(JsonNumberHandling.AllowReadingFromString)]
-    public decimal? DiscountAmount { get; init; }
-
-    public string? Modifiers { get; init; }
-    public string? LineId { get; init; }
-    public JsonElement? SelectedSingle { get; init; }
-    public JsonElement? SelectedMultiple { get; init; }
-
-    public decimal ResolveUnitPrice()
-    {
-        if (Price > 0) return Price;
-        if (UnitPrice.GetValueOrDefault() > 0) return UnitPrice!.Value;
-        if (UnitTotalPrice.GetValueOrDefault() > 0) return UnitTotalPrice!.Value;
-        if (LineTotal.GetValueOrDefault() > 0 && Quantity > 0)
-        {
-            return Math.Round(LineTotal!.Value / Quantity, 2, MidpointRounding.AwayFromZero);
-        }
-
-        if (UnitBasePrice.GetValueOrDefault() > 0 || UnitExtraPrice.GetValueOrDefault() > 0)
-        {
-            return UnitBasePrice.GetValueOrDefault() + UnitExtraPrice.GetValueOrDefault();
-        }
-
-        return 0;
-    }
-
-    public decimal ResolveLineTotal()
-    {
-        if (LineTotal.GetValueOrDefault() > 0) return LineTotal!.Value;
-        return ResolveUnitPrice() * Math.Max(Quantity, 0);
-    }
-
-    public string ResolveModifiers() =>
-        !string.IsNullOrWhiteSpace(Modifiers)
-            ? Modifiers!
-            : BuildSelectionModifiers();
-
-    private string BuildSelectionModifiers()
-    {
-        var parts = new List<string>();
-
-        if (SelectedSingle.HasValue && SelectedSingle.Value.ValueKind == JsonValueKind.Object)
-        {
-            foreach (var property in SelectedSingle.Value.EnumerateObject())
-            {
-                if (property.Value.ValueKind == JsonValueKind.String)
-                {
-                    parts.Add($"{property.Name}:{property.Value.GetString()}");
-                }
-            }
-        }
-
-        if (SelectedMultiple.HasValue && SelectedMultiple.Value.ValueKind == JsonValueKind.Array)
-        {
-            foreach (var item in SelectedMultiple.Value.EnumerateArray())
-            {
-                if (item.ValueKind == JsonValueKind.String)
-                {
-                    parts.Add(item.GetString() ?? string.Empty);
-                }
-            }
-        }
-
-        return string.Join(", ", parts.Where(p => !string.IsNullOrWhiteSpace(p)));
-    }
-}
+internal record CheckoutBasketItem(
+    int? ProductId,
+    string? Name,
+    int Quantity,
+    decimal Price,
+    string? Modifiers);
 
 internal record DbCheckoutOrder(
     int OrderId,
@@ -1995,17 +1906,15 @@ internal static class SubmitOrderHelper
         {
             var item = basket[i];
             var quantity = Math.Max(item.Quantity, 0);
-            var unitPrice = item.ResolveUnitPrice();
-            var lineTotal = item.ResolveLineTotal();
             arr.Add(new JsonObject
             {
-                ["lineId"] = string.IsNullOrWhiteSpace(item.LineId) ? (i + 1).ToString() : item.LineId,
+                ["lineId"] = i + 1,
                 ["productId"] = item.ProductId,
                 ["name"] = item.Name,
                 ["quantity"] = quantity,
-                ["unitPrice"] = unitPrice,
-                ["lineTotal"] = lineTotal,
-                ["modifiers"] = item.ResolveModifiers(),
+                ["unitPrice"] = item.Price,
+                ["lineTotal"] = item.Price * quantity,
+                ["modifiers"] = item.Modifiers ?? "",
                 ["isOth"] = false
             });
         }
