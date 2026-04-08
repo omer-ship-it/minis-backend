@@ -2513,6 +2513,23 @@ app.MapPost("/print-log/final", async (
             ? value.Value.GetRawText()
             : null;
 
+    static JsonNode? CloneJson(JsonElement? value)
+    {
+        if (!value.HasValue || value.Value.ValueKind is JsonValueKind.Undefined or JsonValueKind.Null)
+        {
+            return null;
+        }
+
+        try
+        {
+            return JsonNode.Parse(value.Value.GetRawText());
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
     static async Task<SqlConnection> OpenConnectionAsync(IConfiguration cfg, CancellationToken token)
     {
         var connectionString = ResolveWriteConnectionString(cfg);
@@ -2526,18 +2543,28 @@ app.MapPost("/print-log/final", async (
         return connection;
     }
 
-    static async Task<long?> FindExistingIdAsync(SqlConnection conn, string dedupeKey, CancellationToken token)
+    static async Task<(string MetadataJson, DateTime UpdatedAtUtc)?> FindOrderAsync(SqlConnection conn, int orderId, CancellationToken token)
     {
         const string sql = """
-SELECT TOP (1) id
-FROM dbo.print_log_final
-WHERE dedupe_key = @DedupeKey;
+SELECT TOP (1)
+    ISNULL(CAST(Metadata AS nvarchar(max)), '{}') AS MetadataJson,
+    UpdatedAt
+FROM dbo.Orders
+WHERE Id = @Id;
 """;
 
         await using var cmd = new SqlCommand(sql, conn);
-        cmd.Parameters.AddWithValue("@DedupeKey", dedupeKey);
-        var result = await cmd.ExecuteScalarAsync(token);
-        return result is null || result is DBNull ? null : Convert.ToInt64(result);
+        cmd.Parameters.AddWithValue("@Id", orderId);
+        await using var reader = await cmd.ExecuteReaderAsync(token);
+        if (!await reader.ReadAsync(token))
+        {
+            return null;
+        }
+
+        return (
+            reader.GetString(reader.GetOrdinal("MetadataJson")),
+            reader.GetDateTime(reader.GetOrdinal("UpdatedAt"))
+        );
     }
 
     if (req is null)
@@ -2630,90 +2657,76 @@ WHERE dedupe_key = @DedupeKey;
     var attemptsJson = SerializeJson(req.AttemptsJson);
 
     await using var conn = await OpenConnectionAsync(config, ct);
-
-    try
+    var existingOrder = await FindOrderAsync(conn, req.OrderId, ct);
+    if (existingOrder is null)
     {
-        const string insertSql = """
-INSERT INTO dbo.print_log_final
-(
-    dedupe_key,
-    order_id,
-    station,
-    final_status,
-    device_id,
-    app_version,
-    printer_host,
-    printer_port,
-    started_at,
-    finished_at,
-    total_duration_ms,
-    attempt_count,
-    attempts_json
-)
-VALUES
-(
-    @DedupeKey,
-    @OrderId,
-    @Station,
-    @FinalStatus,
-    @DeviceId,
-    @AppVersion,
-    @PrinterHost,
-    @PrinterPort,
-    @StartedAt,
-    @FinishedAt,
-    @TotalDurationMs,
-    @AttemptCount,
-    @AttemptsJson
-);
-SELECT CAST(SCOPE_IDENTITY() AS bigint);
-""";
-
-        await using var cmd = new SqlCommand(insertSql, conn);
-        cmd.Parameters.AddWithValue("@DedupeKey", dedupeKey);
-        cmd.Parameters.AddWithValue("@OrderId", req.OrderId);
-        cmd.Parameters.AddWithValue("@Station", station);
-        cmd.Parameters.AddWithValue("@FinalStatus", finalStatus);
-        cmd.Parameters.AddWithValue("@DeviceId", (object?)deviceId ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("@AppVersion", (object?)appVersion ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("@PrinterHost", (object?)printerHost ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("@PrinterPort", (object?)req.PrinterPort ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("@StartedAt", (object?)req.StartedAt ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("@FinishedAt", (object?)req.FinishedAt ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("@TotalDurationMs", (object?)req.TotalDurationMs ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("@AttemptCount", req.AttemptCount);
-        cmd.Parameters.AddWithValue("@AttemptsJson", (object?)attemptsJson ?? DBNull.Value);
-
-        var insertedId = Convert.ToInt64(await cmd.ExecuteScalarAsync(ct));
-        log.LogInformation(
-            "Inserted final print log dedupeKey={DedupeKey} orderId={OrderId} rowId={RowId} station={Station} finalStatus={FinalStatus} trace={Trace}",
-            dedupeKey, req.OrderId, insertedId, station, finalStatus, ctx.TraceIdentifier);
-
-        return Results.Ok(new
-        {
-            ok = true,
-            replay = false,
-            id = insertedId,
-            dedupeKey,
-            traceId = ctx.TraceIdentifier
-        });
+        return Results.NotFound(new { ok = false, error = "order not found", traceId = ctx.TraceIdentifier });
     }
-    catch (SqlException ex) when (ex.Number is 2601 or 2627)
+
+    var metadataNode = JsonNode.Parse(existingOrder.Value.MetadataJson) as JsonObject ?? new JsonObject();
+    var printNode = metadataNode["print"] as JsonObject ?? new JsonObject();
+    metadataNode["print"] = printNode;
+    var finalNode = printNode["final"] as JsonObject;
+
+    var existingDedupeKey = finalNode?["dedupeKey"]?.GetValue<string?>();
+    if (string.Equals(existingDedupeKey, dedupeKey, StringComparison.Ordinal))
     {
-        var existingId = await FindExistingIdAsync(conn, dedupeKey, ct);
         log.LogInformation(
-            "Replay final print log dedupeKey={DedupeKey} orderId={OrderId} existingId={ExistingId} trace={Trace}",
-            dedupeKey, req.OrderId, existingId, ctx.TraceIdentifier);
+            "Replay final print metadata dedupeKey={DedupeKey} orderId={OrderId} trace={Trace}",
+            dedupeKey, req.OrderId, ctx.TraceIdentifier);
 
         return Results.Ok(new
         {
             ok = true,
             replay = true,
-            id = existingId,
+            orderId = req.OrderId,
             dedupeKey,
             traceId = ctx.TraceIdentifier
         });
     }
+
+    printNode["final"] = new JsonObject
+    {
+        ["dedupeKey"] = dedupeKey,
+        ["station"] = station,
+        ["finalStatus"] = finalStatus,
+        ["deviceId"] = deviceId,
+        ["appVersion"] = appVersion,
+        ["printerHost"] = printerHost,
+        ["printerPort"] = req.PrinterPort,
+        ["startedAt"] = req.StartedAt?.ToString("O"),
+        ["finishedAt"] = req.FinishedAt?.ToString("O"),
+        ["totalDurationMs"] = req.TotalDurationMs,
+        ["attemptCount"] = req.AttemptCount,
+        ["attempts"] = CloneJson(req.AttemptsJson),
+        ["updatedAtUtc"] = DateTime.UtcNow.ToString("O")
+    };
+
+    const string updateSql = """
+UPDATE dbo.Orders
+SET
+    Metadata = @Metadata,
+    UpdatedAt = SYSUTCDATETIME()
+WHERE Id = @Id;
+""";
+
+    await using var update = new SqlCommand(updateSql, conn);
+    update.Parameters.AddWithValue("@Id", req.OrderId);
+    update.Parameters.AddWithValue("@Metadata", metadataNode.ToJsonString());
+    await update.ExecuteNonQueryAsync(ct);
+
+    log.LogInformation(
+        "Saved final print metadata dedupeKey={DedupeKey} orderId={OrderId} station={Station} finalStatus={FinalStatus} trace={Trace}",
+        dedupeKey, req.OrderId, station, finalStatus, ctx.TraceIdentifier);
+
+    return Results.Ok(new
+    {
+        ok = true,
+        replay = false,
+        orderId = req.OrderId,
+        dedupeKey,
+        traceId = ctx.TraceIdentifier
+    });
 });
 
 app.MapControllers();
