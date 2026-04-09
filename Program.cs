@@ -3449,9 +3449,14 @@ internal sealed class RealZcreditGateway(IConfiguration config, ILogger log) : I
             var transactionId = JsonFlex(root, "TransactionId");
             var hasError = JsonBool(root, "HasError");
             var isApproved = JsonBool(root, "IsApproved") || returnCode == "0";
+            var isCancelled = IsCancelled(returnCode, returnMessage);
             var state = hasError
-                ? (returnCode is "-80" or "-50101" ? "pending" : "declined")
-                : (isApproved ? "paid" : "unknown");
+                ? (isCancelled
+                    ? "declined"
+                    : (returnCode is "-80" or "-50101" ? "pending" : "declined"))
+                : (isApproved
+                    ? "paid"
+                    : (isCancelled ? "declined" : "unknown"));
 
             return new GatewayResult(state, referenceNumber, transactionId, returnCode, returnMessage);
         }
@@ -3472,6 +3477,19 @@ internal sealed class RealZcreditGateway(IConfiguration config, ILogger log) : I
         }
 
         return Task.FromResult(new GatewayResult("unknown", null, null, "NoReference", "Missing reference for reconciliation"));
+    }
+
+    private static bool IsCancelled(string? returnCode, string? returnMessage)
+    {
+        var code = (returnCode ?? "").Trim().ToLowerInvariant();
+        var message = (returnMessage ?? "").Trim().ToLowerInvariant();
+
+        return code is "-100" or "-200" or "cancel" or "cancelled" or "canceled"
+            || message.Contains("cancel")
+            || message.Contains("cancelled")
+            || message.Contains("canceled")
+            || message.Contains("user aborted")
+            || message.Contains("aborted by user");
     }
 
     private static string? JsonFlex(JsonElement root, string name) =>
