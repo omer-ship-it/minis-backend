@@ -322,6 +322,8 @@ ORDER BY Id DESC;
         submitState = order.Checkout.SubmitState,
         referenceNumber = order.Checkout.ReferenceNumber,
         transactionId = order.Checkout.TransactionId,
+        returnCode = order.Checkout.ReturnCode,
+        returnMessage = order.Checkout.ReturnMessage,
         traceId,
         storageMode,
         storageWarning
@@ -339,6 +341,8 @@ ORDER BY Id DESC;
         submitState = order.Checkout.SubmitState,
         referenceNumber = order.Checkout.ReferenceNumber,
         transactionId = order.Checkout.TransactionId,
+        returnCode = order.Checkout.ReturnCode,
+        returnMessage = order.Checkout.ReturnMessage,
         traceId,
         storageMode,
         storageWarning
@@ -1583,6 +1587,8 @@ ORDER BY Id DESC;
             submitState = order.Checkout.SubmitState,
             referenceNumber = order.Checkout.ReferenceNumber,
             transactionId = order.Checkout.TransactionId,
+            returnCode = order.Checkout.ReturnCode,
+            returnMessage = order.Checkout.ReturnMessage,
             traceId,
             storageMode,
             storageWarning
@@ -1600,6 +1606,8 @@ ORDER BY Id DESC;
             submitState = order.Checkout.SubmitState,
             referenceNumber = order.Checkout.ReferenceNumber,
             transactionId = order.Checkout.TransactionId,
+            returnCode = order.Checkout.ReturnCode,
+            returnMessage = order.Checkout.ReturnMessage,
             traceId,
             storageMode,
             storageWarning
@@ -2234,6 +2242,8 @@ WHERE Id = @Id
             submitState = order.Checkout.SubmitState,
             referenceNumber = order.Checkout.ReferenceNumber,
             transactionId = order.Checkout.TransactionId,
+            returnCode = order.Checkout.ReturnCode,
+            returnMessage = order.Checkout.ReturnMessage,
             traceId,
             storageMode = "sql",
             storageWarning = (string?)null
@@ -3408,6 +3418,9 @@ internal sealed class RealZcreditGateway(IConfiguration config, ILogger log) : I
         var terminal = config["ZCredit:TerminalNumber"];
         var password = config["ZCredit:Password"];
         var pinpad = string.IsNullOrWhiteSpace(request.PinpadId) ? config["ZCredit:PinpadId"] : request.PinpadId;
+        var timeoutSeconds = int.TryParse(config["ZCredit:TimeoutSeconds"], out var parsedTimeout) && parsedTimeout > 0
+            ? parsedTimeout
+            : 30;
 
         if (string.IsNullOrWhiteSpace(baseUrl) ||
             string.IsNullOrWhiteSpace(terminal) ||
@@ -3417,7 +3430,7 @@ internal sealed class RealZcreditGateway(IConfiguration config, ILogger log) : I
             throw new InvalidOperationException("Real gateway mode requires ZCredit:BaseUrl, TerminalNumber, Password, and PinpadId.");
         }
 
-        using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
+        using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(timeoutSeconds) };
         var payload = new
         {
             TerminalNumber = terminal,
@@ -3465,7 +3478,7 @@ internal sealed class RealZcreditGateway(IConfiguration config, ILogger log) : I
             log.LogWarning(ex,
                 "Real gateway commit timed out miniAppId={MiniAppId} idem={Idem} pinpadId={PinpadId}",
                 request.MiniAppId, request.IdempotencyKey, pinpad);
-            return new GatewayResult("pending", null, null, "CommitTimeout", "Gateway request timed out after 30 seconds");
+            return new GatewayResult("pending", null, null, "CommitTimeout", $"Gateway request timed out after {timeoutSeconds} seconds");
         }
     }
 
