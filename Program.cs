@@ -3430,28 +3430,38 @@ internal sealed class RealZcreditGateway(IConfiguration config, ILogger log) : I
             TransactionType = request.TransactionType
         };
 
-        var response = await http.PostAsJsonAsync($"{baseUrl.TrimEnd('/')}/Transaction/CommitFullTransaction", payload, ct);
-        var text = await response.Content.ReadAsStringAsync(ct);
-
-        if (!response.IsSuccessStatusCode)
+        try
         {
-            log.LogWarning("Real gateway commit http={Status} body={Body}", (int)response.StatusCode, text);
-            return new GatewayResult("unknown", null, null, $"HTTP{(int)response.StatusCode}", text);
+            var response = await http.PostAsJsonAsync($"{baseUrl.TrimEnd('/')}/Transaction/CommitFullTransaction", payload, ct);
+            var text = await response.Content.ReadAsStringAsync(ct);
+
+            if (!response.IsSuccessStatusCode)
+            {
+                log.LogWarning("Real gateway commit http={Status} body={Body}", (int)response.StatusCode, text);
+                return new GatewayResult("unknown", null, null, $"HTTP{(int)response.StatusCode}", text);
+            }
+
+            using var doc = JsonDocument.Parse(text);
+            var root = doc.RootElement;
+            var returnCode = JsonFlex(root, "ReturnCode");
+            var returnMessage = JsonFlex(root, "ReturnMessage");
+            var referenceNumber = JsonFlex(root, "ReferenceNumber");
+            var transactionId = JsonFlex(root, "TransactionId");
+            var hasError = JsonBool(root, "HasError");
+            var isApproved = JsonBool(root, "IsApproved") || returnCode == "0";
+            var state = hasError
+                ? (returnCode is "-80" or "-50101" ? "pending" : "declined")
+                : (isApproved ? "paid" : "unknown");
+
+            return new GatewayResult(state, referenceNumber, transactionId, returnCode, returnMessage);
         }
-
-        using var doc = JsonDocument.Parse(text);
-        var root = doc.RootElement;
-        var returnCode = JsonFlex(root, "ReturnCode");
-        var returnMessage = JsonFlex(root, "ReturnMessage");
-        var referenceNumber = JsonFlex(root, "ReferenceNumber");
-        var transactionId = JsonFlex(root, "TransactionId");
-        var hasError = JsonBool(root, "HasError");
-        var isApproved = JsonBool(root, "IsApproved") || returnCode == "0";
-        var state = hasError
-            ? (returnCode is "-80" or "-50101" ? "pending" : "declined")
-            : (isApproved ? "paid" : "unknown");
-
-        return new GatewayResult(state, referenceNumber, transactionId, returnCode, returnMessage);
+        catch (TaskCanceledException ex) when (!ct.IsCancellationRequested)
+        {
+            log.LogWarning(ex,
+                "Real gateway commit timed out miniAppId={MiniAppId} idem={Idem} pinpadId={PinpadId}",
+                request.MiniAppId, request.IdempotencyKey, pinpad);
+            return new GatewayResult("pending", null, null, "CommitTimeout", "Gateway request timed out after 30 seconds");
+        }
     }
 
     public Task<GatewayResult> ReconcileAsync(GatewayReconcileRequest request, CancellationToken ct)
