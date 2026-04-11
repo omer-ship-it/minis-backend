@@ -2938,6 +2938,289 @@ WHERE Id = @Id;
     }
 });
 
+app.MapPost("/floor/settle", async (
+    FloorSettleRequest req,
+    IConfiguration config,
+    IHttpClientFactory httpFactory,
+    HttpContext ctx,
+    ILogger<Program> log,
+    CancellationToken ct) =>
+{
+    try
+    {
+        static string NormalizeSource(string? raw) => "cashpoint";
+
+        static string? ResolveWriteConnectionString(IConfiguration cfg) =>
+            cfg.GetConnectionString("DefaultConnection")
+            ?? Environment.GetEnvironmentVariable("SQL_CONNECTION");
+
+        static async Task<SqlConnection> OpenConnectionAsync(IConfiguration cfg, CancellationToken token)
+        {
+            var connectionString = ResolveWriteConnectionString(cfg);
+            if (string.IsNullOrWhiteSpace(connectionString))
+            {
+                throw new InvalidOperationException("Missing write connection string. Set ConnectionStrings:DefaultConnection or SQL_CONNECTION.");
+            }
+
+            var connection = new SqlConnection(connectionString);
+            await connection.OpenAsync(token);
+            return connection;
+        }
+
+        static string NormalizePaymentMode(string? raw)
+        {
+            var value = (raw ?? "").Trim().ToLowerInvariant();
+            return value switch
+            {
+                "cash" => "cash",
+                "card" => "card",
+                _ => ""
+            };
+        }
+
+        static string NormalizeIdempotency(string? raw, int orderNumber, string paymentMode)
+            => string.IsNullOrWhiteSpace(raw) ? $"floor-settle:{paymentMode}:{orderNumber}" : raw.Trim();
+
+        static JsonElement BuildSettlementPaymentElement(string paymentMode, decimal amount)
+        {
+            object payload = paymentMode == "cash"
+                ? new
+                {
+                    provider = "minis",
+                    method = "cash",
+                    cardAmount = 0m,
+                    cashAmount = amount
+                }
+                : new
+                {
+                    provider = "zcredit",
+                    method = "card",
+                    cardAmount = amount,
+                    cashAmount = 0m
+                };
+
+            return JsonSerializer.SerializeToElement(payload);
+        }
+
+        static string ResolveCurrency(CheckoutOrderPayload order, string? preferred)
+        {
+            if (!string.IsNullOrWhiteSpace(preferred))
+            {
+                return preferred.Trim().ToUpperInvariant();
+            }
+
+            if (order.Totals.HasValue &&
+                order.Totals.Value.ValueKind == JsonValueKind.Object &&
+                order.Totals.Value.TryGetProperty("currency", out var currencyProp) &&
+                currencyProp.ValueKind == JsonValueKind.String &&
+                !string.IsNullOrWhiteSpace(currencyProp.GetString()))
+            {
+                return currencyProp.GetString()!.Trim().ToUpperInvariant();
+            }
+
+            return "ILS";
+        }
+
+        static async Task<DbCheckoutOrder?> FindExistingFloorOrderAsync(SqlConnection conn, int miniAppId, int orderNumber, CancellationToken token)
+        {
+            const string sql = """
+SELECT TOP (1)
+    Id,
+    MiniAppId,
+    Total,
+    Status,
+    ISNULL(PaymentMethod, 'unpaid') AS PaymentMethod,
+    CreatedAt,
+    UpdatedAt,
+    ISNULL(CAST(Metadata AS nvarchar(max)), '{}') AS MetadataJson,
+    JSON_VALUE(Metadata, '$.checkout.state') AS CheckoutState,
+    JSON_VALUE(Metadata, '$.checkout.submitState') AS SubmitState,
+    JSON_VALUE(Metadata, '$.checkout.referenceNumber') AS ReferenceNumber,
+    JSON_VALUE(Metadata, '$.checkout.transactionId') AS TransactionId,
+    JSON_VALUE(Metadata, '$.checkout.returnCode') AS ReturnCode,
+    JSON_VALUE(Metadata, '$.checkout.returnMessage') AS ReturnMessage
+FROM dbo.Orders
+WHERE MiniAppId = @MiniAppId
+  AND JSON_VALUE(Metadata, '$.schema') = 'floor.send.v1'
+  AND TRY_CONVERT(int, JSON_VALUE(Metadata, '$.floor.orderNumber')) = @OrderNumber
+ORDER BY Id DESC;
+""";
+
+            await using var cmd = new SqlCommand(sql, conn);
+            cmd.Parameters.AddWithValue("@MiniAppId", miniAppId);
+            cmd.Parameters.AddWithValue("@OrderNumber", orderNumber);
+
+            await using var reader = await cmd.ExecuteReaderAsync(token);
+            if (!await reader.ReadAsync(token))
+            {
+                return null;
+            }
+
+            return new DbCheckoutOrder(
+                OrderId: reader.GetInt32(reader.GetOrdinal("Id")),
+                MiniAppId: reader.GetInt32(reader.GetOrdinal("MiniAppId")),
+                Amount: reader.GetDecimal(reader.GetOrdinal("Total")),
+                Status: reader.GetInt32(reader.GetOrdinal("Status")),
+                PaymentMethod: reader.GetString(reader.GetOrdinal("PaymentMethod")),
+                CreatedAtUtc: reader.GetDateTime(reader.GetOrdinal("CreatedAt")),
+                UpdatedAtUtc: reader.GetDateTime(reader.GetOrdinal("UpdatedAt")),
+                MetadataJson: reader.GetString(reader.GetOrdinal("MetadataJson")),
+                Checkout: new DbCheckoutState(
+                    State: reader.IsDBNull(reader.GetOrdinal("CheckoutState")) ? "unknown" : reader.GetString(reader.GetOrdinal("CheckoutState")),
+                    SubmitState: reader.IsDBNull(reader.GetOrdinal("SubmitState")) ? "not_started" : reader.GetString(reader.GetOrdinal("SubmitState")),
+                    ReferenceNumber: reader.IsDBNull(reader.GetOrdinal("ReferenceNumber")) ? null : reader.GetString(reader.GetOrdinal("ReferenceNumber")),
+                    TransactionId: reader.IsDBNull(reader.GetOrdinal("TransactionId")) ? null : reader.GetString(reader.GetOrdinal("TransactionId")),
+                    ReturnCode: reader.IsDBNull(reader.GetOrdinal("ReturnCode")) ? null : reader.GetString(reader.GetOrdinal("ReturnCode")),
+                    ReturnMessage: reader.IsDBNull(reader.GetOrdinal("ReturnMessage")) ? null : reader.GetString(reader.GetOrdinal("ReturnMessage"))));
+        }
+
+        static object BuildResponse(DbCheckoutOrder order, int requestedOrderNumber, string traceId)
+        {
+            var submittedOrderId = SubmitOrderHelper.TryExtractSubmittedOrderId(order.MetadataJson);
+            return new
+            {
+                ok = order.Checkout.State == "paid" && order.Checkout.SubmitState == "done",
+                replay = false,
+                orderId = order.OrderId,
+                requestedOrderNumber,
+                legacyOrderId = submittedOrderId,
+                status = order.Status,
+                paymentMethod = order.PaymentMethod,
+                checkoutState = order.Checkout.State,
+                submitState = order.Checkout.SubmitState,
+                referenceNumber = order.Checkout.ReferenceNumber,
+                transactionId = order.Checkout.TransactionId,
+                returnCode = order.Checkout.ReturnCode,
+                returnMessage = order.Checkout.ReturnMessage,
+                traceId
+            };
+        }
+
+        if (req.OrderNumber <= 0)
+        {
+            return Results.BadRequest(new { ok = false, error = "orderNumber is required", traceId = ctx.TraceIdentifier });
+        }
+
+        var paymentMode = NormalizePaymentMode(req.PaymentMode);
+        if (string.IsNullOrWhiteSpace(paymentMode))
+        {
+            return Results.BadRequest(new { ok = false, error = "paymentMode must be cash or card", traceId = ctx.TraceIdentifier });
+        }
+
+        var miniAppId = req.MiniAppId.GetValueOrDefault(12);
+        await using var conn = await OpenConnectionAsync(config, ct);
+        var existing = await FindExistingFloorOrderAsync(conn, miniAppId, req.OrderNumber, ct);
+        if (existing is null)
+        {
+            return Results.NotFound(new { ok = false, error = "Floor order not found", traceId = ctx.TraceIdentifier });
+        }
+
+        var existingOrder = SubmitOrderHelper.TryExtractOrder(existing.MetadataJson);
+        if (existingOrder is null)
+        {
+            return Results.Conflict(new { ok = false, error = "Could not extract floor order payload from metadata", traceId = ctx.TraceIdentifier });
+        }
+
+        var submittedOrderId = SubmitOrderHelper.TryExtractSubmittedOrderId(existing.MetadataJson);
+        if (!submittedOrderId.HasValue || submittedOrderId.Value <= 0)
+        {
+            return Results.Conflict(new { ok = false, error = "Could not find existing downstream orderId to settle", traceId = ctx.TraceIdentifier });
+        }
+
+        var currency = ResolveCurrency(existingOrder, req.Currency);
+        var amount = req.Amount.HasValue && req.Amount.Value > 0 ? req.Amount.Value : existing.Amount;
+        var settlementIdempotencyKey = NormalizeIdempotency(req.IdempotencyKey, req.OrderNumber, paymentMode);
+        var settledOrder = existingOrder with
+        {
+            Source = NormalizeSource(existingOrder.Source),
+            Payment = BuildSettlementPaymentElement(paymentMode, amount)
+        };
+
+        var gatewayResult = paymentMode == "cash"
+            ? new GatewayResult("paid", null, null, null, "Cash accepted")
+            : new GatewayResult(
+                "paid",
+                string.IsNullOrWhiteSpace(req.ReferenceNumber) ? existing.Checkout.ReferenceNumber : req.ReferenceNumber,
+                string.IsNullOrWhiteSpace(req.TransactionId) ? existing.Checkout.TransactionId : req.TransactionId,
+                string.IsNullOrWhiteSpace(req.ReturnCode) ? "0" : req.ReturnCode,
+                string.IsNullOrWhiteSpace(req.ReturnMessage) ? "Card approved" : req.ReturnMessage);
+
+        var submitResult = await SubmitOrderHelper.SubmitAsync(
+            httpFactory,
+            config,
+            log,
+            app.Environment,
+            settledOrder,
+            existing.MiniAppId,
+            existing.OrderId,
+            amount,
+            currency,
+            settlementIdempotencyKey,
+            req.PinpadId,
+            string.IsNullOrWhiteSpace(req.TransactionType) ? "01" : req.TransactionType,
+            gatewayResult,
+            submittedOrderId,
+            ct);
+
+        var metadataNode = JsonNode.Parse(existing.MetadataJson) as JsonObject ?? new JsonObject();
+        var checkoutNode = metadataNode["checkout"] as JsonObject ?? new JsonObject();
+        metadataNode["checkout"] = checkoutNode;
+        checkoutNode["provider"] = paymentMode == "card" ? "zcredit" : "offline";
+        checkoutNode["method"] = paymentMode;
+        checkoutNode["state"] = "paid";
+        checkoutNode["submitState"] = submitResult.SubmitState;
+        checkoutNode["amount"] = amount;
+        checkoutNode["currency"] = currency;
+        checkoutNode["referenceNumber"] = gatewayResult.ReferenceNumber;
+        checkoutNode["transactionId"] = gatewayResult.TransactionId;
+        checkoutNode["returnCode"] = gatewayResult.ReturnCode;
+        checkoutNode["returnMessage"] = gatewayResult.ReturnMessage;
+        checkoutNode["updatedAtUtc"] = DateTime.UtcNow.ToString("O");
+        metadataNode["orderSource"] = NormalizeSource(settledOrder.Source);
+        metadataNode["order"] = JsonSerializer.SerializeToNode(settledOrder);
+        metadataNode["basketCount"] = settledOrder.Basket?.Count ?? 0;
+
+        SubmitOrderHelper.ApplySubmitResult(metadataNode, submitResult);
+
+        const string updateSql = """
+UPDATE dbo.Orders
+SET
+    Total = @Total,
+    Status = 1,
+    PaymentMethod = @PaymentMethod,
+    PaymentReference = @PaymentReference,
+    PaymentApprovedAtUtc = SYSUTCDATETIME(),
+    Metadata = @Metadata,
+    UpdatedAt = SYSUTCDATETIME()
+WHERE Id = @Id;
+""";
+
+        await using var update = new SqlCommand(updateSql, conn);
+        update.Parameters.AddWithValue("@Id", existing.OrderId);
+        update.Parameters.AddWithValue("@Total", amount);
+        update.Parameters.AddWithValue("@PaymentMethod", paymentMode);
+        update.Parameters.AddWithValue("@PaymentReference", (object?)gatewayResult.ReferenceNumber ?? DBNull.Value);
+        update.Parameters.AddWithValue("@Metadata", metadataNode.ToJsonString());
+        await update.ExecuteNonQueryAsync(ct);
+
+        var finalOrder = await FindExistingFloorOrderAsync(conn, miniAppId, req.OrderNumber, ct)
+            ?? throw new InvalidOperationException($"Floor settled order {existing.OrderId} could not be reloaded.");
+
+        return Results.Ok(BuildResponse(finalOrder, req.OrderNumber, ctx.TraceIdentifier));
+    }
+    catch (Exception ex)
+    {
+        log.LogError(ex, "Floor settle endpoint failed trace={Trace}", ctx.TraceIdentifier);
+        return Results.Json(new
+        {
+            ok = false,
+            error = ex.Message,
+            type = ex.GetType().FullName,
+            traceId = ctx.TraceIdentifier
+        }, statusCode: 500);
+    }
+});
+
 app.MapGet("/checkout/debug/orders", async (IConfiguration config, CancellationToken ct) =>
 {
     var connectionString =
@@ -3377,6 +3660,20 @@ internal record FloorSendOrderRequest(
     string? Name = null,
     string? Currency = null,
     string? IdempotencyKey = null);
+
+internal record FloorSettleRequest(
+    int? MiniAppId,
+    int OrderNumber,
+    string? PaymentMode,
+    decimal? Amount = null,
+    string? Currency = null,
+    string? IdempotencyKey = null,
+    string? ReferenceNumber = null,
+    string? TransactionId = null,
+    string? ReturnCode = null,
+    string? ReturnMessage = null,
+    string? PinpadId = null,
+    string? TransactionType = null);
 
 internal record FloorSendLine(
     [property: JsonNumberHandling(JsonNumberHandling.AllowReadingFromString)] int Quantity,
