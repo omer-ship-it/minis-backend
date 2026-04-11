@@ -2401,6 +2401,25 @@ app.MapPost("/floor/send-order", async (
             return $"floor:{miniAppId}:{orderNumber}:{hash}";
         }
 
+        static int ResolveFloorCustomerId(FloorSendOrderRequest request, IConfiguration cfg)
+        {
+            if (request.CustomerId.HasValue && request.CustomerId.Value > 0)
+            {
+                return request.CustomerId.Value;
+            }
+
+            var configured =
+                cfg["CheckoutDebug:FloorDefaultCustomerId"]
+                ?? cfg["CheckoutDebug:DefaultCustomerId"];
+
+            if (int.TryParse(configured, out var parsed) && parsed > 0)
+            {
+                return parsed;
+            }
+
+            return 1;
+        }
+
         static string? ResolveWriteConnectionString(IConfiguration cfg) =>
             cfg.GetConnectionString("DefaultConnection")
             ?? Environment.GetEnvironmentVariable("SQL_CONNECTION");
@@ -2675,9 +2694,11 @@ ORDER BY Id DESC;
             ?? req.IdempotencyKey
             ?? computedIdem);
 
+        var floorCustomerId = ResolveFloorCustomerId(req, config);
+
         var checkoutOrder = new CheckoutOrderPayload(
             MiniAppId: miniAppId,
-            CustomerId: req.CustomerId,
+            CustomerId: floorCustomerId,
             UUID: idempotencyKey,
             Email: string.IsNullOrWhiteSpace(req.Email) ? "customer@example.com" : req.Email.Trim(),
             Name: string.IsNullOrWhiteSpace(req.Name) ? "Floor Order" : req.Name.Trim(),
@@ -2736,7 +2757,7 @@ SELECT CAST(SCOPE_IDENTITY() AS int);
         var initialMetadata = BuildFloorMetadata(req, checkoutOrder, miniAppId, idempotencyKey, total, currency, req.OrderNumber, null);
         await using var insert = new SqlCommand(insertSql, conn);
         insert.Parameters.AddWithValue("@MiniAppId", miniAppId);
-        insert.Parameters.AddWithValue("@CustomerId", (object?)req.CustomerId ?? DBNull.Value);
+        insert.Parameters.AddWithValue("@CustomerId", floorCustomerId);
         insert.Parameters.AddWithValue("@Total", total);
         insert.Parameters.AddWithValue("@Status", 0);
         insert.Parameters.AddWithValue("@Metadata", initialMetadata.ToJsonString());
