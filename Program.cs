@@ -2192,6 +2192,7 @@ app.MapPost("/checkout/offline/settle", async (
                     UUID = string.IsNullOrWhiteSpace(incoming.UUID) ? existing.UUID : incoming.UUID,
                     Email = string.IsNullOrWhiteSpace(incoming.Email) ? existing.Email : incoming.Email,
                     Name = string.IsNullOrWhiteSpace(incoming.Name) ? existing.Name : incoming.Name,
+                    Phone = string.IsNullOrWhiteSpace(incoming.Phone) ? existing.Phone : incoming.Phone,
                     Source = string.IsNullOrWhiteSpace(incoming.Source) ? existing.Source : incoming.Source,
                     Basket = incoming.Basket is { Count: > 0 } ? incoming.Basket : existing.Basket,
                     IdempotencyKey = string.IsNullOrWhiteSpace(incoming.IdempotencyKey) ? existing.IdempotencyKey : incoming.IdempotencyKey,
@@ -3944,6 +3945,7 @@ internal record CheckoutOrderPayload(
     string? Source,
     List<CheckoutBasketItem>? Basket,
     string? IdempotencyKey,
+    string? Phone = null,
     string? DiningMode = null,
     string? Service = null,
     JsonElement? Totals = null,
@@ -4348,6 +4350,11 @@ internal static class SubmitOrderHelper
             }
         };
 
+        if (!string.IsNullOrWhiteSpace(order.Phone))
+        {
+            payload["phone"] = order.Phone;
+        }
+
         if (isCardPayment)
         {
             payload["zcredit"] = new JsonObject
@@ -4407,6 +4414,17 @@ internal static class SubmitOrderHelper
         if (CloneNode(order.Notifications) is JsonNode notificationsNode)
         {
             payload["notifications"] = notificationsNode;
+        }
+        else if (!string.IsNullOrWhiteSpace(order.Phone))
+        {
+            payload["notifications"] = new JsonObject
+            {
+                ["wa"] = new JsonObject
+                {
+                    ["phone"] = order.Phone,
+                    ["consent"] = 1
+                }
+            };
         }
 
         if (CloneNode(order.Delivery) is JsonNode deliveryNode)
