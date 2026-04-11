@@ -2077,8 +2077,8 @@ app.MapPost("/checkout/offline/settle", async (
     {
         static string NormalizeSource(string? raw) => "cashpoint";
 
-        static string NormalizeIdempotency(string? raw, int checkoutOrderId) =>
-            string.IsNullOrWhiteSpace(raw) ? $"settle-cash-{checkoutOrderId}" : raw.Trim();
+        static string NormalizeIdempotency(string? raw, int checkoutOrderId, string paymentMode) =>
+            string.IsNullOrWhiteSpace(raw) ? $"settle-{paymentMode}-{checkoutOrderId}" : raw.Trim();
 
         static string ResolveSubmitMode(IConfiguration cfg, IHostEnvironment env)
         {
@@ -2114,19 +2114,52 @@ app.MapPost("/checkout/offline/settle", async (
             return value switch
             {
                 "cash" => "cash",
+                "card" => "card",
                 _ => ""
             };
         }
 
-        static JsonElement BuildOfflinePaymentElement(decimal amount)
+        static bool IsApprovedCardSettlement(string? returnCode, string? returnMessage)
         {
-            return JsonSerializer.SerializeToElement(new
+            if (string.Equals((returnCode ?? "").Trim(), "0", StringComparison.OrdinalIgnoreCase))
             {
-                provider = "minis",
-                method = "cash",
-                cardAmount = 0m,
-                cashAmount = amount
-            });
+                return true;
+            }
+
+            return string.Equals((returnMessage ?? "").Trim(), "Approved", StringComparison.OrdinalIgnoreCase);
+        }
+
+        static JsonElement BuildSettlementPaymentElement(string paymentMode, decimal amount)
+        {
+            object payload = paymentMode == "cash"
+                ? new
+                {
+                    provider = "minis",
+                    method = "cash",
+                    cardAmount = 0m,
+                    cashAmount = amount
+                }
+                : new
+                {
+                    provider = "zcredit",
+                    method = "card",
+                    cardAmount = amount,
+                    cashAmount = 0m
+                };
+
+            return JsonSerializer.SerializeToElement(payload);
+        }
+
+        static GatewayResult BuildSettlementGatewayResult(string paymentMode, DbCheckoutOrder existing, CheckoutOfflineSettleRequest request)
+        {
+            return paymentMode == "cash"
+                ? new GatewayResult("paid", null, null, null, "Cash accepted")
+                : new GatewayResult(
+                    "paid",
+                    string.IsNullOrWhiteSpace(request.ReferenceNumber) ? existing.Checkout.ReferenceNumber : request.ReferenceNumber,
+                    string.IsNullOrWhiteSpace(request.TransactionId) ? existing.Checkout.TransactionId : request.TransactionId,
+                    string.IsNullOrWhiteSpace(request.ReturnCode) ? "0" : request.ReturnCode,
+                    string.IsNullOrWhiteSpace(request.ReturnMessage) ? "Approved" : request.ReturnMessage);
         }
 
         static string ResolveCurrency(CheckoutOrderPayload order, string? preferred)
@@ -2148,7 +2181,7 @@ app.MapPost("/checkout/offline/settle", async (
             return "ILS";
         }
 
-        static CheckoutOrderPayload MergeOrder(CheckoutOrderPayload existing, CheckoutOrderPayload? incoming, decimal amount)
+        static CheckoutOrderPayload MergeOrder(CheckoutOrderPayload existing, CheckoutOrderPayload? incoming, string paymentMode, decimal amount)
         {
             var merged = incoming is null
                 ? existing
@@ -2176,7 +2209,7 @@ app.MapPost("/checkout/offline/settle", async (
             return merged with
             {
                 Source = NormalizeSource(merged.Source),
-                Payment = BuildOfflinePaymentElement(amount)
+                Payment = BuildSettlementPaymentElement(paymentMode, amount)
             };
         }
 
@@ -2258,7 +2291,7 @@ WHERE Id = @Id
         var paymentMode = NormalizePaymentMode(req.PaymentMode);
         if (string.IsNullOrWhiteSpace(paymentMode))
         {
-            return Results.BadRequest(new { ok = false, error = "settle paymentMode must be cash", traceId = ctx.TraceIdentifier });
+            return Results.BadRequest(new { ok = false, error = "settle paymentMode must be cash or card", traceId = ctx.TraceIdentifier });
         }
 
         await using var conn = await OpenConnectionAsync(config, ct);
@@ -2278,6 +2311,16 @@ WHERE Id = @Id
             return Results.BadRequest(new { ok = false, error = $"Order state must be pay_later, found {existing.Checkout.State}", traceId = ctx.TraceIdentifier });
         }
 
+        if (paymentMode == "card" && !IsApprovedCardSettlement(req.ReturnCode, req.ReturnMessage))
+        {
+            return Results.BadRequest(new
+            {
+                ok = false,
+                error = "card settlement requires approved returnCode or returnMessage",
+                traceId = ctx.TraceIdentifier
+            });
+        }
+
         var existingOrder = SubmitOrderHelper.TryExtractOrder(existing.MetadataJson);
         if (existingOrder is null)
         {
@@ -2290,15 +2333,17 @@ WHERE Id = @Id
             return Results.Conflict(new { ok = false, error = "Could not find submitted downstream orderId to update", traceId = ctx.TraceIdentifier });
         }
 
-        var mergedOrder = MergeOrder(existingOrder, req.Order, existing.Amount);
+        var amount = req.Amount.HasValue && req.Amount.Value > 0 ? req.Amount.Value : existing.Amount;
+        var mergedOrder = MergeOrder(existingOrder, req.Order, paymentMode, amount);
         var currency = ResolveCurrency(mergedOrder, req.Currency);
-        var settlementIdempotencyKey = NormalizeIdempotency(req.IdempotencyKey, existing.OrderId);
+        var settlementIdempotencyKey = NormalizeIdempotency(req.IdempotencyKey, existing.OrderId, paymentMode);
         var submitMode = ResolveSubmitMode(config, app.Environment);
         var metadataNode = JsonNode.Parse(existing.MetadataJson) as JsonObject ?? new JsonObject();
         var checkoutNode = metadataNode["checkout"] as JsonObject ?? new JsonObject();
         metadataNode["checkout"] = checkoutNode;
-        checkoutNode["provider"] = "offline";
-        checkoutNode["method"] = "cash";
+        var gatewayResult = BuildSettlementGatewayResult(paymentMode, existing, req);
+        checkoutNode["provider"] = paymentMode == "card" ? "zcredit" : "offline";
+        checkoutNode["method"] = paymentMode;
         if (checkoutNode["initialState"] is null)
         {
             checkoutNode["initialState"] = existing.Checkout.State;
@@ -2308,13 +2353,15 @@ WHERE Id = @Id
         checkoutNode["settledAtUtc"] = DateTime.UtcNow.ToString("O");
         checkoutNode["state"] = "paid";
         checkoutNode["submitState"] = existing.Checkout.SubmitState;
-        checkoutNode["amount"] = existing.Amount;
+        checkoutNode["amount"] = amount;
         checkoutNode["currency"] = currency;
-        checkoutNode["transactionType"] = null;
-        checkoutNode["referenceNumber"] = null;
-        checkoutNode["transactionId"] = null;
-        checkoutNode["returnCode"] = null;
-        checkoutNode["returnMessage"] = "Cash accepted";
+        checkoutNode["transactionType"] = paymentMode == "card"
+            ? (string.IsNullOrWhiteSpace(req.TransactionType) ? "01" : req.TransactionType)
+            : null;
+        checkoutNode["referenceNumber"] = gatewayResult.ReferenceNumber;
+        checkoutNode["transactionId"] = gatewayResult.TransactionId;
+        checkoutNode["returnCode"] = gatewayResult.ReturnCode;
+        checkoutNode["returnMessage"] = gatewayResult.ReturnMessage;
         checkoutNode["updatedAtUtc"] = DateTime.UtcNow.ToString("O");
         metadataNode["orderSource"] = NormalizeSource(mergedOrder.Source);
         metadataNode["order"] = JsonSerializer.SerializeToNode(mergedOrder);
@@ -2331,12 +2378,12 @@ WHERE Id = @Id
                 mergedOrder,
                 existing.MiniAppId,
                 existing.OrderId,
-                existing.Amount,
+                amount,
                 currency,
                 settlementIdempotencyKey,
-                null,
-                "",
-                new GatewayResult("paid", null, null, null, "Cash accepted"),
+                req.PinpadId,
+                string.IsNullOrWhiteSpace(req.TransactionType) ? "01" : req.TransactionType,
+                gatewayResult,
                 submittedOrderId,
                 ct);
 
@@ -2349,8 +2396,8 @@ WHERE Id = @Id
 UPDATE dbo.Orders
 SET
     Status = 1,
-    PaymentMethod = 'cash',
-    PaymentReference = NULL,
+    PaymentMethod = @PaymentMethod,
+    PaymentReference = @PaymentReference,
     PaymentApprovedAtUtc = SYSUTCDATETIME(),
     Metadata = @Metadata,
     UpdatedAt = SYSUTCDATETIME()
@@ -2359,6 +2406,8 @@ WHERE Id = @Id;
 
         await using var update = new SqlCommand(updateSql, conn);
         update.Parameters.AddWithValue("@Id", existing.OrderId);
+        update.Parameters.AddWithValue("@PaymentMethod", paymentMode);
+        update.Parameters.AddWithValue("@PaymentReference", (object?)gatewayResult.ReferenceNumber ?? DBNull.Value);
         update.Parameters.AddWithValue("@Metadata", metadataNode.ToJsonString());
         await update.ExecuteNonQueryAsync(ct);
 
@@ -3318,7 +3367,14 @@ app.MapPost("/orders/submit", async (
             Currency: req.Payment?.Currency ?? req.Currency,
             IdempotencyKey: req.IdempotencyKey,
             PaymentMode: paymentMode,
-            Order: req.Order);
+            Order: req.Order,
+            Amount: req.Payment?.Amount ?? req.Amount,
+            ReferenceNumber: req.Payment?.ReferenceNumber ?? req.ReferenceNumber,
+            TransactionId: req.Payment?.TransactionId ?? req.TransactionId,
+            ReturnCode: req.Payment?.ReturnCode ?? req.ReturnCode,
+            ReturnMessage: req.Payment?.ReturnMessage ?? req.ReturnMessage,
+            PinpadId: req.Payment?.PinpadId ?? req.PinpadId,
+            TransactionType: req.Payment?.TransactionType ?? req.TransactionType);
     }
     else if (paymentMode == "card")
     {
@@ -3771,7 +3827,14 @@ internal record CheckoutOfflineSettleRequest(
     string? Currency,
     string? IdempotencyKey,
     string? PaymentMode,
-    CheckoutOrderPayload? Order);
+    CheckoutOrderPayload? Order,
+    decimal? Amount = null,
+    string? ReferenceNumber = null,
+    string? TransactionId = null,
+    string? ReturnCode = null,
+    string? ReturnMessage = null,
+    string? PinpadId = null,
+    string? TransactionType = null);
 
 internal record PrintLogFinalRequest(
     string? DedupeKey,
