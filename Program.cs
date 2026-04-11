@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Security.Cryptography;
 using System.Text.Json.Nodes;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -2392,6 +2393,14 @@ app.MapPost("/floor/send-order", async (
         static string NormalizeIdempotency(string? raw) =>
             string.IsNullOrWhiteSpace(raw) ? Guid.NewGuid().ToString("N") : raw.Trim();
 
+        static string BuildCompactFloorIdempotencyKey(int miniAppId, int orderNumber, int? course, string? tableKey, int? tableNumber, decimal total)
+        {
+            var raw = $"{miniAppId}|{orderNumber}|{course}|{tableKey}|{tableNumber}|{total:0.00}";
+            var bytes = SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(raw));
+            var hash = Convert.ToHexString(bytes[..8]).ToLowerInvariant();
+            return $"floor:{miniAppId}:{orderNumber}:{hash}";
+        }
+
         static string? ResolveWriteConnectionString(IConfiguration cfg) =>
             cfg.GetConnectionString("DefaultConnection")
             ?? Environment.GetEnvironmentVariable("SQL_CONNECTION");
@@ -2659,7 +2668,7 @@ ORDER BY Id DESC;
                 ? value.ToString()
                 : null;
 
-        var computedIdem = $"floor:{miniAppId}:{req.OrderNumber}:{req.Course}:{req.TableKey}:{req.TableNumber}:{total:0.00}";
+        var computedIdem = BuildCompactFloorIdempotencyKey(miniAppId, req.OrderNumber, req.Course, req.TableKey, req.TableNumber, total);
         var idempotencyKey = NormalizeIdempotency(
             Corr("Idempotency-Key")
             ?? Corr("X-Request-Id")
