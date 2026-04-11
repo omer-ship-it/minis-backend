@@ -2635,17 +2635,22 @@ ORDER BY Id DESC;
                     ReturnMessage: reader.IsDBNull(reader.GetOrdinal("ReturnMessage")) ? null : reader.GetString(reader.GetOrdinal("ReturnMessage"))));
         }
 
-        static object BuildResponse(DbCheckoutOrder order, int legacyOrderId, bool replay, string traceId) => new
+        static object BuildResponse(DbCheckoutOrder order, int requestedOrderNumber, bool replay, string traceId)
         {
-            ok = order.Checkout.SubmitState == "done",
-            replay,
-            orderId = order.OrderId,
-            legacyOrderId,
-            status = order.Status,
-            paymentMethod = order.PaymentMethod,
-            checkoutState = order.Checkout.State,
-            submitState = order.Checkout.SubmitState,
-            traceId
+            var submittedOrderId = SubmitOrderHelper.TryExtractSubmittedOrderId(order.MetadataJson);
+            return new
+            {
+                ok = order.Checkout.SubmitState == "done",
+                replay,
+                orderId = order.OrderId,
+                requestedOrderNumber,
+                legacyOrderId = submittedOrderId,
+                status = order.Status,
+                paymentMethod = order.PaymentMethod,
+                checkoutState = order.Checkout.State,
+                submitState = order.Checkout.SubmitState,
+                traceId
+            };
         };
 
         if (req.OrderNumber <= 0)
@@ -2754,7 +2759,7 @@ VALUES
 SELECT CAST(SCOPE_IDENTITY() AS int);
 """;
 
-        var initialMetadata = BuildFloorMetadata(req, checkoutOrder, miniAppId, idempotencyKey, total, currency, req.OrderNumber, null);
+        var initialMetadata = BuildFloorMetadata(req, checkoutOrder, miniAppId, idempotencyKey, total, currency, null, null);
         await using var insert = new SqlCommand(insertSql, conn);
         insert.Parameters.AddWithValue("@MiniAppId", miniAppId);
         insert.Parameters.AddWithValue("@CustomerId", floorCustomerId);
@@ -2781,10 +2786,10 @@ SELECT CAST(SCOPE_IDENTITY() AS int);
             null,
             "",
             new GatewayResult("pay_later", null, null, null, "Floor send accepted"),
-            req.OrderNumber,
+            null,
             ct);
 
-        var metadataNode = BuildFloorMetadata(req, checkoutOrder, miniAppId, idempotencyKey, total, currency, req.OrderNumber, submitResult);
+        var metadataNode = BuildFloorMetadata(req, checkoutOrder, miniAppId, idempotencyKey, total, currency, submitResult.SubmittedOrderId, submitResult);
         SubmitOrderHelper.ApplySubmitResult(metadataNode, submitResult);
 
         const string updateSql = """
