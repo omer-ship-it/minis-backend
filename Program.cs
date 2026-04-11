@@ -3221,6 +3221,152 @@ WHERE Id = @Id;
     }
 });
 
+app.MapPost("/orders/submit", async (
+    OrdersSubmitRequest req,
+    IHttpClientFactory httpFactory,
+    HttpContext ctx,
+    CancellationToken ct) =>
+{
+    static string NormalizeIntent(string? raw)
+    {
+        var value = (raw ?? "").Trim().ToLowerInvariant();
+        return value switch
+        {
+            "open" => "update",
+            "create" => "update",
+            "update" => "update",
+            "submit" => "update",
+            "settle" => "settle",
+            "complete" => "settle",
+            _ => ""
+        };
+    }
+
+    static string NormalizePaymentMode(string? raw)
+    {
+        var value = (raw ?? "").Trim().ToLowerInvariant();
+        return value switch
+        {
+            "cash" => "cash",
+            "card" => "card",
+            "pay_later" => "pay_later",
+            "paylater" => "pay_later",
+            "unpaid" => "unpaid",
+            _ => ""
+        };
+    }
+
+    static bool HasFloorIdentity(OrdersSubmitRequest request) => request.OrderNumber.HasValue && request.OrderNumber.Value > 0;
+
+    var intent = NormalizeIntent(req.Intent);
+    var paymentMode = NormalizePaymentMode(req.Payment?.Mode);
+
+    if (string.IsNullOrWhiteSpace(intent))
+    {
+        return Results.BadRequest(new { ok = false, error = "intent must be update or settle", traceId = ctx.TraceIdentifier });
+    }
+
+    var client = httpFactory.CreateClient();
+    client.Timeout = TimeSpan.FromSeconds(60);
+    var baseUrl = $"{ctx.Request.Scheme}://{ctx.Request.Host}";
+
+    string targetPath;
+    object payload;
+
+    if (HasFloorIdentity(req))
+    {
+        if (intent == "settle")
+        {
+            targetPath = "/floor/settle";
+            payload = new FloorSettleRequest(
+                MiniAppId: req.MiniAppId,
+                OrderNumber: req.OrderNumber!.Value,
+                PaymentMode: paymentMode,
+                Amount: req.Payment?.Amount ?? req.Amount,
+                Currency: req.Payment?.Currency ?? req.Currency,
+                IdempotencyKey: req.IdempotencyKey,
+                ReferenceNumber: req.Payment?.ReferenceNumber ?? req.ReferenceNumber,
+                TransactionId: req.Payment?.TransactionId ?? req.TransactionId,
+                ReturnCode: req.Payment?.ReturnCode ?? req.ReturnCode,
+                ReturnMessage: req.Payment?.ReturnMessage ?? req.ReturnMessage,
+                PinpadId: req.Payment?.PinpadId ?? req.PinpadId,
+                TransactionType: req.Payment?.TransactionType ?? req.TransactionType);
+        }
+        else
+        {
+            targetPath = "/floor/send-order";
+            payload = new FloorSendOrderRequest(
+                MiniAppId: req.MiniAppId,
+                OrderNumber: req.OrderNumber!.Value,
+                TableKey: req.TableKey,
+                TableNumber: req.TableNumber,
+                Course: req.Course,
+                Lines: req.Lines,
+                CustomerId: req.CustomerId,
+                Email: req.Email,
+                Name: req.Name,
+                Currency: req.Currency,
+                IdempotencyKey: req.IdempotencyKey);
+        }
+    }
+    else if (intent == "settle")
+    {
+        targetPath = "/checkout/offline/settle";
+        payload = new CheckoutOfflineSettleRequest(
+            CheckoutOrderId: req.CheckoutOrderId ?? 0,
+            MiniAppId: req.MiniAppId,
+            Currency: req.Payment?.Currency ?? req.Currency,
+            IdempotencyKey: req.IdempotencyKey,
+            PaymentMode: paymentMode,
+            Order: req.Order);
+    }
+    else if (paymentMode == "card")
+    {
+        targetPath = "/checkout/zcredit/card";
+        payload = new CheckoutZcreditCardRequest(
+            MiniAppId: req.MiniAppId,
+            Amount: req.Payment?.Amount ?? req.Amount ?? 0m,
+            Currency: req.Payment?.Currency ?? req.Currency,
+            IdempotencyKey: req.IdempotencyKey,
+            TransactionType: req.Payment?.TransactionType ?? req.TransactionType,
+            PinpadId: req.Payment?.PinpadId ?? req.PinpadId,
+            DebugOutcome: req.DebugOutcome,
+            Order: req.Order);
+    }
+    else
+    {
+        payload = new CheckoutOfflineRequest(
+            MiniAppId: req.MiniAppId,
+            Amount: req.Payment?.Amount ?? req.Amount ?? 0m,
+            Currency: req.Payment?.Currency ?? req.Currency,
+            IdempotencyKey: req.IdempotencyKey,
+            PaymentMode: paymentMode == "unpaid" ? "pay_later" : paymentMode,
+            Order: req.Order);
+        targetPath = "/checkout/offline";
+    }
+
+    using var forward = new HttpRequestMessage(HttpMethod.Post, $"{baseUrl}{targetPath}")
+    {
+        Content = new StringContent(JsonSerializer.Serialize(payload), System.Text.Encoding.UTF8, "application/json")
+    };
+
+    if (ctx.Request.Headers.TryGetValue("Idempotency-Key", out var idemHeader) && !string.IsNullOrWhiteSpace(idemHeader))
+    {
+        forward.Headers.TryAddWithoutValidation("Idempotency-Key", idemHeader.ToString());
+    }
+
+    if (ctx.Request.Headers.TryGetValue("X-Request-Id", out var reqIdHeader) && !string.IsNullOrWhiteSpace(reqIdHeader))
+    {
+        forward.Headers.TryAddWithoutValidation("X-Request-Id", reqIdHeader.ToString());
+    }
+
+    using var response = await client.SendAsync(forward, ct);
+    var body = await response.Content.ReadAsStringAsync(ct);
+    var contentType = response.Content.Headers.ContentType?.ToString() ?? "application/json; charset=utf-8";
+
+    return Results.Content(body, contentType, null, (int)response.StatusCode);
+});
+
 app.MapGet("/checkout/debug/orders", async (IConfiguration config, CancellationToken ct) =>
 {
     var connectionString =
@@ -3647,6 +3793,43 @@ internal record PrintLogFinalRequest(
     int AttemptCount = 0,
     JsonElement? Attempts = null,
     JsonElement? AttemptsJson = null);
+
+internal record OrdersSubmitRequest(
+    int? MiniAppId,
+    string? Context,
+    string? Intent,
+    int? CheckoutOrderId,
+    int? OrderNumber,
+    int? TableNumber,
+    string? TableKey,
+    int? Course,
+    decimal? Amount,
+    string? Currency,
+    string? IdempotencyKey,
+    int? CustomerId,
+    string? Email,
+    string? Name,
+    string? ReferenceNumber,
+    string? TransactionId,
+    string? ReturnCode,
+    string? ReturnMessage,
+    string? PinpadId,
+    string? TransactionType,
+    string? DebugOutcome,
+    OrdersSubmitPayment? Payment,
+    List<FloorSendLine>? Lines,
+    CheckoutOrderPayload? Order);
+
+internal record OrdersSubmitPayment(
+    string? Mode,
+    decimal? Amount,
+    string? Currency,
+    string? ReferenceNumber,
+    string? TransactionId,
+    string? ReturnCode,
+    string? ReturnMessage,
+    string? PinpadId,
+    string? TransactionType);
 
 internal record FloorSendOrderRequest(
     int? MiniAppId,
