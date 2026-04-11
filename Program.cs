@@ -1426,6 +1426,156 @@ WHERE Id = @Id;
     }
 });
 
+app.MapPost("/payments/zcredit/cancel", async (
+    ZcreditCancelRequest req,
+    IConfiguration cfg,
+    IHttpClientFactory httpFactory,
+    HttpContext ctx,
+    ILogger<Program> log,
+    CancellationToken ct) =>
+{
+    try
+    {
+        static string NormalizeDigits(string? raw) =>
+            new string((raw ?? "").Where(char.IsDigit).ToArray());
+
+        var zc = cfg.GetSection("ZCredit");
+        var gatewayMode = (cfg["CheckoutDebug:GatewayMode"] ?? "fake").Trim().ToLowerInvariant();
+        var terminal = (zc["TerminalNumber"] ?? "").Trim();
+        var password = (zc["Password"] ?? "").Trim();
+        var configuredBaseUrl = (zc["BaseUrl"] ?? "").Trim();
+        var configuredPinpad = (zc["PinpadId"] ?? "").Trim();
+        var headerPinpad = ctx.Request.Headers["x-pinpad-id"].ToString();
+        var rawPinpadId =
+            !string.IsNullOrWhiteSpace(headerPinpad) ? headerPinpad :
+            !string.IsNullOrWhiteSpace(req.PinpadId) ? req.PinpadId :
+            configuredPinpad;
+
+        if (string.IsNullOrWhiteSpace(terminal) || string.IsNullOrWhiteSpace(password))
+        {
+            return Results.Json(new { ok = false, message = "Missing ZCredit config", traceId = ctx.TraceIdentifier }, statusCode: 500);
+        }
+
+        var digits = NormalizeDigits(rawPinpadId);
+        if (string.IsNullOrWhiteSpace(digits))
+        {
+            return Results.Json(new { ok = false, message = "Invalid PinpadId", traceId = ctx.TraceIdentifier }, statusCode: 400);
+        }
+
+        var track2 = $"PINPAD{digits}";
+
+        if (gatewayMode != "real")
+        {
+            log.LogInformation(
+                "ZCredit cancel skipped in non-real mode mode={Mode} terminal={Terminal} track2={Track2}",
+                gatewayMode, terminal, track2);
+            return Results.Ok(new
+            {
+                ok = true,
+                code = 0,
+                message = "Cancel simulated in non-real gateway mode",
+                statusCode = 200,
+                upstream = "{}",
+                traceId = ctx.TraceIdentifier
+            });
+        }
+
+        var baseUrl = string.IsNullOrWhiteSpace(configuredBaseUrl)
+            ? "https://pci.zcredit.co.il/ZCreditWS/api"
+            : configuredBaseUrl.TrimEnd('/');
+
+        var client = httpFactory.CreateClient();
+        client.Timeout = TimeSpan.FromSeconds(15);
+
+        var payload = new
+        {
+            TerminalNumber = terminal,
+            password,
+            Track2 = track2
+        };
+
+        using var response = await client.PostAsJsonAsync($"{baseUrl}/Transaction/ReleasePinpad", payload, ct);
+        var body = await response.Content.ReadAsStringAsync(ct);
+
+        var ok = response.IsSuccessStatusCode;
+        int? code = null;
+        string? message = null;
+
+        try
+        {
+            using var doc = JsonDocument.Parse(string.IsNullOrWhiteSpace(body) ? "{}" : body);
+            var root = doc.RootElement;
+
+            if (root.TryGetProperty("ReturnCode", out var returnCodeNode))
+            {
+                if (returnCodeNode.ValueKind == JsonValueKind.Number && returnCodeNode.TryGetInt32(out var parsedInt))
+                {
+                    code = parsedInt;
+                }
+                else if (returnCodeNode.ValueKind == JsonValueKind.String &&
+                         int.TryParse(returnCodeNode.GetString(), out var parsedString))
+                {
+                    code = parsedString;
+                }
+            }
+
+            if (root.TryGetProperty("ReturnMessage", out var returnMessageNode) &&
+                returnMessageNode.ValueKind == JsonValueKind.String)
+            {
+                message = returnMessageNode.GetString();
+            }
+
+            if (root.TryGetProperty("HasError", out var hasErrorNode) &&
+                hasErrorNode.ValueKind == JsonValueKind.True)
+            {
+                ok = false;
+            }
+
+            if (code == 0)
+            {
+                ok = true;
+            }
+        }
+        catch
+        {
+            // keep HTTP-derived status if upstream payload is not JSON
+        }
+
+        log.LogInformation(
+            "ReleasePinpad cancel terminal={Terminal} track2={Track2} status={Status} ok={Ok} code={Code} message={Message} body={Body}",
+            terminal,
+            track2,
+            (int)response.StatusCode,
+            ok,
+            code,
+            message,
+            body.Length > 800 ? body[..800] + "…" : body);
+
+        return Results.Json(
+            new
+            {
+                ok,
+                code,
+                message,
+                statusCode = (int)response.StatusCode,
+                upstream = body,
+                traceId = ctx.TraceIdentifier
+            },
+            statusCode: ok ? 200 : 502);
+    }
+    catch (Exception ex)
+    {
+        log.LogError(ex, "ZCredit cancel endpoint failed trace={Trace}", ctx.TraceIdentifier);
+        return Results.Json(new
+        {
+            ok = false,
+            error = ex.Message,
+            type = ex.GetType().FullName,
+            traceId = ctx.TraceIdentifier
+        }, statusCode: 500);
+    }
+});
+
 app.MapPost("/checkout/offline", async (
     CheckoutOfflineRequest req,
     IConfiguration config,
@@ -3836,6 +3986,10 @@ internal record CheckoutOfflineSettleRequest(
     string? ReturnMessage = null,
     string? PinpadId = null,
     string? TransactionType = null);
+
+internal record ZcreditCancelRequest(
+    string? StreamId,
+    string? PinpadId);
 
 internal record PrintLogFinalRequest(
     string? DedupeKey,
