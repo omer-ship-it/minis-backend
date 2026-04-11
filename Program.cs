@@ -2379,6 +2379,419 @@ WHERE Id = @Id;
     }
 });
 
+app.MapPost("/floor/send-order", async (
+    FloorSendOrderRequest req,
+    IConfiguration config,
+    IHttpClientFactory httpFactory,
+    HttpContext ctx,
+    ILogger<Program> log,
+    CancellationToken ct) =>
+{
+    try
+    {
+        static string NormalizeIdempotency(string? raw) =>
+            string.IsNullOrWhiteSpace(raw) ? Guid.NewGuid().ToString("N") : raw.Trim();
+
+        static string? ResolveWriteConnectionString(IConfiguration cfg) =>
+            cfg.GetConnectionString("DefaultConnection")
+            ?? Environment.GetEnvironmentVariable("SQL_CONNECTION");
+
+        static async Task<SqlConnection> OpenConnectionAsync(IConfiguration cfg, CancellationToken token)
+        {
+            var connectionString = ResolveWriteConnectionString(cfg);
+            if (string.IsNullOrWhiteSpace(connectionString))
+            {
+                throw new InvalidOperationException("Missing write connection string. Set ConnectionStrings:DefaultConnection or SQL_CONNECTION.");
+            }
+
+            var connection = new SqlConnection(connectionString);
+            await connection.OpenAsync(token);
+            return connection;
+        }
+
+        static decimal R2(decimal value) => Math.Round(value, 2, MidpointRounding.AwayFromZero);
+
+        static string BuildModifiers(FloorSendLine line)
+        {
+            var parts = new List<string>();
+
+            if (line.SelectedSingle.HasValue && line.SelectedSingle.Value.ValueKind == JsonValueKind.Object)
+            {
+                foreach (var prop in line.SelectedSingle.Value.EnumerateObject().OrderBy(p => p.Name, StringComparer.Ordinal))
+                {
+                    var value = prop.Value.ValueKind == JsonValueKind.String ? prop.Value.GetString() : prop.Value.ToString();
+                    if (!string.IsNullOrWhiteSpace(value))
+                    {
+                        parts.Add($"{prop.Name}: {value}");
+                    }
+                }
+            }
+
+            if (line.SelectedMultiple.HasValue && line.SelectedMultiple.Value.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var item in line.SelectedMultiple.Value.EnumerateArray())
+                {
+                    if (item.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(item.GetString()))
+                    {
+                        parts.Add(item.GetString()!);
+                    }
+                    else if (item.ValueKind == JsonValueKind.Object)
+                    {
+                        foreach (var prop in item.EnumerateObject().OrderBy(p => p.Name, StringComparer.Ordinal))
+                        {
+                            var value = prop.Value.ValueKind == JsonValueKind.String ? prop.Value.GetString() : prop.Value.ToString();
+                            if (!string.IsNullOrWhiteSpace(value))
+                            {
+                                parts.Add($"{prop.Name}: {value}");
+                            }
+                        }
+                    }
+                }
+            }
+
+            return string.Join(", ", parts);
+        }
+
+        static decimal ResolveLineUnitPrice(FloorSendLine line)
+        {
+            var explicitUnit = line.UnitPrice ?? line.UnitTotalPrice ?? (line.UnitBasePrice + line.UnitExtraPrice);
+            var quantity = Math.Max(1, line.Quantity);
+            var explicitLineTotal = line.LineTotal;
+            if (explicitLineTotal.HasValue && explicitLineTotal.Value > 0)
+            {
+                var discounted = explicitLineTotal.Value / quantity;
+                return R2(discounted);
+            }
+
+            var subtotal = explicitUnit * quantity;
+            var discount = Math.Max(0m, line.DiscountAmount);
+            var total = Math.Max(0m, subtotal - discount);
+            return quantity > 0 ? R2(total / quantity) : R2(explicitUnit);
+        }
+
+        static decimal ResolveLineTotal(FloorSendLine line)
+        {
+            var quantity = Math.Max(0, line.Quantity);
+            if (line.LineTotal.HasValue && line.LineTotal.Value >= 0)
+            {
+                return R2(line.LineTotal.Value);
+            }
+
+            return R2(ResolveLineUnitPrice(line) * quantity);
+        }
+
+        static JsonElement BuildTotalsElement(decimal subtotal, decimal total, string currency)
+        {
+            var payload = new
+            {
+                subtotal,
+                total,
+                discount = R2(Math.Max(0m, subtotal - total)),
+                currency
+            };
+
+            return JsonSerializer.SerializeToElement(payload);
+        }
+
+        static JsonElement BuildPaymentElement()
+        {
+            var payload = new
+            {
+                provider = "minis",
+                method = "unpaid",
+                cardAmount = 0m,
+                cashAmount = 0m
+            };
+
+            return JsonSerializer.SerializeToElement(payload);
+        }
+
+        static JsonObject BuildFloorMetadata(
+            FloorSendOrderRequest request,
+            CheckoutOrderPayload order,
+            int miniAppId,
+            string idempotencyKey,
+            decimal total,
+            string currency,
+            int? submittedOrderId,
+            SubmitOrderAttemptResult? submitResult)
+        {
+            var now = DateTime.UtcNow;
+            return new JsonObject
+            {
+                ["schema"] = "floor.send.v1",
+                ["shopId"] = miniAppId,
+                ["idempotency"] = idempotencyKey,
+                ["createdAtUtc"] = now.ToString("O"),
+                ["orderSource"] = "cashpoint",
+                ["checkout"] = new JsonObject
+                {
+                    ["provider"] = "floor",
+                    ["method"] = "unpaid",
+                    ["state"] = "open",
+                    ["submitState"] = submitResult?.SubmitState ?? "not_started",
+                    ["amount"] = total,
+                    ["currency"] = currency,
+                    ["updatedAtUtc"] = now.ToString("O")
+                },
+                ["submit"] = new JsonObject
+                {
+                    ["state"] = submitResult?.SubmitState ?? "not_started",
+                    ["orderId"] = submittedOrderId,
+                    ["replay"] = submitResult?.Replay,
+                    ["httpStatus"] = submitResult?.HttpStatus,
+                    ["error"] = submitResult?.Error,
+                    ["attemptedAtUtc"] = submitResult?.AttemptedAtUtc.ToString("O")
+                },
+                ["floor"] = new JsonObject
+                {
+                    ["orderNumber"] = request.OrderNumber,
+                    ["tableKey"] = request.TableKey,
+                    ["tableNumber"] = request.TableNumber,
+                    ["course"] = request.Course
+                },
+                ["order"] = JsonNode.Parse(JsonSerializer.Serialize(order)),
+                ["basketCount"] = order.Basket?.Count ?? 0
+            };
+        }
+
+        static async Task<DbCheckoutOrder?> FindExistingAsync(SqlConnection conn, int miniAppId, string idempotencyKey, CancellationToken token)
+        {
+            const string sql = """
+SELECT TOP (1)
+    Id,
+    MiniAppId,
+    Total,
+    Status,
+    ISNULL(PaymentMethod, 'unpaid') AS PaymentMethod,
+    CreatedAt,
+    UpdatedAt,
+    ISNULL(CAST(Metadata AS nvarchar(max)), '{}') AS MetadataJson,
+    JSON_VALUE(Metadata, '$.checkout.state') AS CheckoutState,
+    JSON_VALUE(Metadata, '$.checkout.submitState') AS SubmitState,
+    JSON_VALUE(Metadata, '$.checkout.referenceNumber') AS ReferenceNumber,
+    JSON_VALUE(Metadata, '$.checkout.transactionId') AS TransactionId,
+    JSON_VALUE(Metadata, '$.checkout.returnCode') AS ReturnCode,
+    JSON_VALUE(Metadata, '$.checkout.returnMessage') AS ReturnMessage
+FROM dbo.Orders
+WHERE MiniAppId = @MiniAppId
+  AND IdempotencyKeyRaw = @IdempotencyKey
+ORDER BY Id DESC;
+""";
+
+            await using var cmd = new SqlCommand(sql, conn);
+            cmd.Parameters.AddWithValue("@MiniAppId", miniAppId);
+            cmd.Parameters.AddWithValue("@IdempotencyKey", idempotencyKey);
+
+            await using var reader = await cmd.ExecuteReaderAsync(token);
+            if (!await reader.ReadAsync(token))
+            {
+                return null;
+            }
+
+            return new DbCheckoutOrder(
+                OrderId: reader.GetInt32(reader.GetOrdinal("Id")),
+                MiniAppId: reader.GetInt32(reader.GetOrdinal("MiniAppId")),
+                Amount: reader.GetDecimal(reader.GetOrdinal("Total")),
+                Status: reader.GetInt32(reader.GetOrdinal("Status")),
+                PaymentMethod: reader.GetString(reader.GetOrdinal("PaymentMethod")),
+                CreatedAtUtc: reader.GetDateTime(reader.GetOrdinal("CreatedAt")),
+                UpdatedAtUtc: reader.GetDateTime(reader.GetOrdinal("UpdatedAt")),
+                MetadataJson: reader.GetString(reader.GetOrdinal("MetadataJson")),
+                Checkout: new DbCheckoutState(
+                    State: reader.IsDBNull(reader.GetOrdinal("CheckoutState")) ? "unknown" : reader.GetString(reader.GetOrdinal("CheckoutState")),
+                    SubmitState: reader.IsDBNull(reader.GetOrdinal("SubmitState")) ? "not_started" : reader.GetString(reader.GetOrdinal("SubmitState")),
+                    ReferenceNumber: reader.IsDBNull(reader.GetOrdinal("ReferenceNumber")) ? null : reader.GetString(reader.GetOrdinal("ReferenceNumber")),
+                    TransactionId: reader.IsDBNull(reader.GetOrdinal("TransactionId")) ? null : reader.GetString(reader.GetOrdinal("TransactionId")),
+                    ReturnCode: reader.IsDBNull(reader.GetOrdinal("ReturnCode")) ? null : reader.GetString(reader.GetOrdinal("ReturnCode")),
+                    ReturnMessage: reader.IsDBNull(reader.GetOrdinal("ReturnMessage")) ? null : reader.GetString(reader.GetOrdinal("ReturnMessage"))));
+        }
+
+        static object BuildResponse(DbCheckoutOrder order, int legacyOrderId, bool replay, string traceId) => new
+        {
+            ok = order.Checkout.SubmitState == "done",
+            replay,
+            orderId = order.OrderId,
+            legacyOrderId,
+            status = order.Status,
+            paymentMethod = order.PaymentMethod,
+            checkoutState = order.Checkout.State,
+            submitState = order.Checkout.SubmitState,
+            traceId
+        };
+
+        if (req.OrderNumber <= 0)
+        {
+            return Results.BadRequest(new { ok = false, error = "orderNumber is required", traceId = ctx.TraceIdentifier });
+        }
+
+        if (req.Lines is null || req.Lines.Count == 0)
+        {
+            return Results.BadRequest(new { ok = false, error = "lines are required", traceId = ctx.TraceIdentifier });
+        }
+
+        var miniAppId = req.MiniAppId.GetValueOrDefault(12);
+        if (miniAppId <= 0)
+        {
+            return Results.BadRequest(new { ok = false, error = "miniAppId is required", traceId = ctx.TraceIdentifier });
+        }
+
+        var basket = req.Lines.Select(line => new CheckoutBasketItem
+        {
+            ProductId = int.TryParse(line.ProductId, out var productId) ? productId : null,
+            Name = line.Name,
+            Quantity = Math.Max(0, line.Quantity),
+            Price = ResolveLineUnitPrice(line),
+            Modifiers = BuildModifiers(line)
+        }).ToList();
+
+        var subtotal = R2(req.Lines.Sum(line =>
+        {
+            var quantity = Math.Max(0, line.Quantity);
+            var unit = line.UnitPrice ?? line.UnitTotalPrice ?? (line.UnitBasePrice + line.UnitExtraPrice);
+            return unit * quantity;
+        }));
+        var total = R2(req.Lines.Sum(ResolveLineTotal));
+        var currency = string.IsNullOrWhiteSpace(req.Currency) ? "ILS" : req.Currency.Trim().ToUpperInvariant();
+
+        string? Corr(string key) =>
+            ctx.Request.Headers.TryGetValue(key, out var value) && !string.IsNullOrWhiteSpace(value)
+                ? value.ToString()
+                : null;
+
+        var computedIdem = $"floor:{miniAppId}:{req.OrderNumber}:{req.Course}:{req.TableKey}:{req.TableNumber}:{total:0.00}";
+        var idempotencyKey = NormalizeIdempotency(
+            Corr("Idempotency-Key")
+            ?? Corr("X-Request-Id")
+            ?? req.IdempotencyKey
+            ?? computedIdem);
+
+        var checkoutOrder = new CheckoutOrderPayload(
+            MiniAppId: miniAppId,
+            CustomerId: req.CustomerId,
+            UUID: idempotencyKey,
+            Email: string.IsNullOrWhiteSpace(req.Email) ? "customer@example.com" : req.Email.Trim(),
+            Name: string.IsNullOrWhiteSpace(req.Name) ? "Floor Order" : req.Name.Trim(),
+            Source: "cashpoint",
+            Basket: basket,
+            IdempotencyKey: idempotencyKey,
+            DiningMode: "dineIn",
+            Service: "sit",
+            Totals: BuildTotalsElement(subtotal, total, currency),
+            Payment: BuildPaymentElement(),
+            TicketNumber: null,
+            OrderType: "floor_send",
+            TabKey: string.IsNullOrWhiteSpace(req.TableKey) ? null : req.TableKey.Trim());
+
+        await using var conn = await OpenConnectionAsync(config, ct);
+        var existing = await FindExistingAsync(conn, miniAppId, idempotencyKey, ct);
+        if (existing is not null)
+        {
+            return Results.Ok(BuildResponse(existing, req.OrderNumber, replay: true, ctx.TraceIdentifier));
+        }
+
+        const string insertSql = """
+INSERT INTO dbo.Orders
+(
+    MiniAppId,
+    CustomerId,
+    Total,
+    Status,
+    Metadata,
+    CreatedAt,
+    UpdatedAt,
+    Source,
+    PaymentMethod,
+    TicketNumber,
+    AutoPrintEligible,
+    IdempotencyKeyRaw
+)
+VALUES
+(
+    @MiniAppId,
+    @CustomerId,
+    @Total,
+    @Status,
+    @Metadata,
+    SYSUTCDATETIME(),
+    SYSUTCDATETIME(),
+    @Source,
+    @PaymentMethod,
+    NULL,
+    0,
+    @IdempotencyKey
+);
+SELECT CAST(SCOPE_IDENTITY() AS int);
+""";
+
+        var initialMetadata = BuildFloorMetadata(req, checkoutOrder, miniAppId, idempotencyKey, total, currency, req.OrderNumber, null);
+        await using var insert = new SqlCommand(insertSql, conn);
+        insert.Parameters.AddWithValue("@MiniAppId", miniAppId);
+        insert.Parameters.AddWithValue("@CustomerId", (object?)req.CustomerId ?? DBNull.Value);
+        insert.Parameters.AddWithValue("@Total", total);
+        insert.Parameters.AddWithValue("@Status", 0);
+        insert.Parameters.AddWithValue("@Metadata", initialMetadata.ToJsonString());
+        insert.Parameters.AddWithValue("@Source", "cashpoint");
+        insert.Parameters.AddWithValue("@PaymentMethod", "unpaid");
+        insert.Parameters.AddWithValue("@IdempotencyKey", idempotencyKey);
+
+        var localOrderId = Convert.ToInt32(await insert.ExecuteScalarAsync(ct));
+
+        var submitResult = await SubmitOrderHelper.SubmitAsync(
+            httpFactory,
+            config,
+            log,
+            app.Environment,
+            checkoutOrder,
+            miniAppId,
+            localOrderId,
+            total,
+            currency,
+            idempotencyKey,
+            null,
+            "",
+            new GatewayResult("pay_later", null, null, null, "Floor send accepted"),
+            req.OrderNumber,
+            ct);
+
+        var metadataNode = BuildFloorMetadata(req, checkoutOrder, miniAppId, idempotencyKey, total, currency, req.OrderNumber, submitResult);
+        SubmitOrderHelper.ApplySubmitResult(metadataNode, submitResult);
+
+        const string updateSql = """
+UPDATE dbo.Orders
+SET
+    Metadata = @Metadata,
+    UpdatedAt = SYSUTCDATETIME()
+WHERE Id = @Id;
+""";
+
+        await using var update = new SqlCommand(updateSql, conn);
+        update.Parameters.AddWithValue("@Id", localOrderId);
+        update.Parameters.AddWithValue("@Metadata", metadataNode.ToJsonString());
+        await update.ExecuteNonQueryAsync(ct);
+
+        var finalOrder = await FindExistingAsync(conn, miniAppId, idempotencyKey, ct)
+            ?? throw new InvalidOperationException($"Floor order {localOrderId} was updated but could not be reloaded.");
+
+        var statusCode = submitResult.SubmitState == "done"
+            ? StatusCodes.Status200OK
+            : StatusCodes.Status502BadGateway;
+
+        return Results.Json(BuildResponse(finalOrder, req.OrderNumber, replay: false, ctx.TraceIdentifier), statusCode: statusCode);
+    }
+    catch (Exception ex)
+    {
+        log.LogError(ex, "Floor send endpoint failed trace={Trace}", ctx.TraceIdentifier);
+        return Results.Json(new
+        {
+            ok = false,
+            error = ex.Message,
+            type = ex.GetType().FullName,
+            traceId = ctx.TraceIdentifier
+        }, statusCode: 500);
+    }
+});
+
 app.MapGet("/checkout/debug/orders", async (IConfiguration config, CancellationToken ct) =>
 {
     var connectionString =
@@ -2805,6 +3218,33 @@ internal record PrintLogFinalRequest(
     int AttemptCount = 0,
     JsonElement? Attempts = null,
     JsonElement? AttemptsJson = null);
+
+internal record FloorSendOrderRequest(
+    int? MiniAppId,
+    int OrderNumber,
+    string? TableKey,
+    int? TableNumber,
+    int? Course,
+    List<FloorSendLine>? Lines,
+    int? CustomerId = null,
+    string? Email = null,
+    string? Name = null,
+    string? Currency = null,
+    string? IdempotencyKey = null);
+
+internal record FloorSendLine(
+    [property: JsonNumberHandling(JsonNumberHandling.AllowReadingFromString)] int Quantity,
+    [property: JsonNumberHandling(JsonNumberHandling.AllowReadingFromString)] decimal DiscountAmount,
+    JsonElement? SelectedSingle,
+    [property: JsonNumberHandling(JsonNumberHandling.AllowReadingFromString)] decimal UnitBasePrice,
+    string? LineId,
+    string? ProductId,
+    string? Name,
+    [property: JsonNumberHandling(JsonNumberHandling.AllowReadingFromString)] decimal UnitExtraPrice,
+    JsonElement? SelectedMultiple,
+    [property: JsonNumberHandling(JsonNumberHandling.AllowReadingFromString)] decimal? UnitPrice = null,
+    [property: JsonNumberHandling(JsonNumberHandling.AllowReadingFromString)] decimal? UnitTotalPrice = null,
+    [property: JsonNumberHandling(JsonNumberHandling.AllowReadingFromString)] decimal? LineTotal = null);
 
 internal record CheckoutOrderPayload(
     int MiniAppId,
