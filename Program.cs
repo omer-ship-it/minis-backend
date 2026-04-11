@@ -2583,6 +2583,59 @@ app.MapPost("/floor/send-order", async (
             };
         }
 
+        static async Task<DbCheckoutOrder?> FindExistingFloorOrderAsync(SqlConnection conn, int miniAppId, int orderNumber, CancellationToken token)
+        {
+            const string sql = """
+SELECT TOP (1)
+    Id,
+    MiniAppId,
+    Total,
+    Status,
+    ISNULL(PaymentMethod, 'unpaid') AS PaymentMethod,
+    CreatedAt,
+    UpdatedAt,
+    ISNULL(CAST(Metadata AS nvarchar(max)), '{}') AS MetadataJson,
+    JSON_VALUE(Metadata, '$.checkout.state') AS CheckoutState,
+    JSON_VALUE(Metadata, '$.checkout.submitState') AS SubmitState,
+    JSON_VALUE(Metadata, '$.checkout.referenceNumber') AS ReferenceNumber,
+    JSON_VALUE(Metadata, '$.checkout.transactionId') AS TransactionId,
+    JSON_VALUE(Metadata, '$.checkout.returnCode') AS ReturnCode,
+    JSON_VALUE(Metadata, '$.checkout.returnMessage') AS ReturnMessage
+FROM dbo.Orders
+WHERE MiniAppId = @MiniAppId
+  AND JSON_VALUE(Metadata, '$.schema') = 'floor.send.v1'
+  AND TRY_CONVERT(int, JSON_VALUE(Metadata, '$.floor.orderNumber')) = @OrderNumber
+ORDER BY Id DESC;
+""";
+
+            await using var cmd = new SqlCommand(sql, conn);
+            cmd.Parameters.AddWithValue("@MiniAppId", miniAppId);
+            cmd.Parameters.AddWithValue("@OrderNumber", orderNumber);
+
+            await using var reader = await cmd.ExecuteReaderAsync(token);
+            if (!await reader.ReadAsync(token))
+            {
+                return null;
+            }
+
+            return new DbCheckoutOrder(
+                OrderId: reader.GetInt32(reader.GetOrdinal("Id")),
+                MiniAppId: reader.GetInt32(reader.GetOrdinal("MiniAppId")),
+                Amount: reader.GetDecimal(reader.GetOrdinal("Total")),
+                Status: reader.GetInt32(reader.GetOrdinal("Status")),
+                PaymentMethod: reader.GetString(reader.GetOrdinal("PaymentMethod")),
+                CreatedAtUtc: reader.GetDateTime(reader.GetOrdinal("CreatedAt")),
+                UpdatedAtUtc: reader.GetDateTime(reader.GetOrdinal("UpdatedAt")),
+                MetadataJson: reader.GetString(reader.GetOrdinal("MetadataJson")),
+                Checkout: new DbCheckoutState(
+                    State: reader.IsDBNull(reader.GetOrdinal("CheckoutState")) ? "unknown" : reader.GetString(reader.GetOrdinal("CheckoutState")),
+                    SubmitState: reader.IsDBNull(reader.GetOrdinal("SubmitState")) ? "not_started" : reader.GetString(reader.GetOrdinal("SubmitState")),
+                    ReferenceNumber: reader.IsDBNull(reader.GetOrdinal("ReferenceNumber")) ? null : reader.GetString(reader.GetOrdinal("ReferenceNumber")),
+                    TransactionId: reader.IsDBNull(reader.GetOrdinal("TransactionId")) ? null : reader.GetString(reader.GetOrdinal("TransactionId")),
+                    ReturnCode: reader.IsDBNull(reader.GetOrdinal("ReturnCode")) ? null : reader.GetString(reader.GetOrdinal("ReturnCode")),
+                    ReturnMessage: reader.IsDBNull(reader.GetOrdinal("ReturnMessage")) ? null : reader.GetString(reader.GetOrdinal("ReturnMessage"))));
+        }
+
         static async Task<DbCheckoutOrder?> FindExistingAsync(SqlConnection conn, int miniAppId, string idempotencyKey, CancellationToken token)
         {
             const string sql = """
@@ -2651,7 +2704,7 @@ ORDER BY Id DESC;
                 submitState = order.Checkout.SubmitState,
                 traceId
             };
-        };
+        }
 
         if (req.OrderNumber <= 0)
         {
@@ -2719,10 +2772,68 @@ ORDER BY Id DESC;
             TabKey: string.IsNullOrWhiteSpace(req.TableKey) ? null : req.TableKey.Trim());
 
         await using var conn = await OpenConnectionAsync(config, ct);
-        var existing = await FindExistingAsync(conn, miniAppId, idempotencyKey, ct);
+        var existing = await FindExistingFloorOrderAsync(conn, miniAppId, req.OrderNumber, ct);
         if (existing is not null)
         {
-            return Results.Ok(BuildResponse(existing, req.OrderNumber, replay: true, ctx.TraceIdentifier));
+            var existingRoot = JsonNode.Parse(existing.MetadataJson) as JsonObject ?? new JsonObject();
+            var existingIdempotency = existingRoot["idempotency"]?.GetValue<string?>();
+            if (string.Equals(existingIdempotency, idempotencyKey, StringComparison.Ordinal))
+            {
+                return Results.Ok(BuildResponse(existing, req.OrderNumber, replay: true, ctx.TraceIdentifier));
+            }
+
+            var existingSubmittedOrderId = SubmitOrderHelper.TryExtractSubmittedOrderId(existing.MetadataJson);
+            var updateSubmitResult = await SubmitOrderHelper.SubmitAsync(
+                httpFactory,
+                config,
+                log,
+                app.Environment,
+                checkoutOrder,
+                miniAppId,
+                existing.OrderId,
+                total,
+                currency,
+                idempotencyKey,
+                null,
+                "",
+                new GatewayResult("pay_later", null, null, null, "Floor send updated"),
+                existingSubmittedOrderId,
+                ct);
+
+            var updatedMetadataNode = BuildFloorMetadata(
+                req,
+                checkoutOrder,
+                miniAppId,
+                idempotencyKey,
+                total,
+                currency,
+                updateSubmitResult.SubmittedOrderId ?? existingSubmittedOrderId,
+                updateSubmitResult);
+            SubmitOrderHelper.ApplySubmitResult(updatedMetadataNode, updateSubmitResult);
+
+            const string updateExistingSql = """
+UPDATE dbo.Orders
+SET
+    CustomerId = @CustomerId,
+    Total = @Total,
+    Metadata = @Metadata,
+    PaymentMethod = @PaymentMethod,
+    IdempotencyKeyRaw = @IdempotencyKey,
+    UpdatedAt = SYSUTCDATETIME()
+WHERE Id = @Id;
+""";
+
+            await using var updateExisting = new SqlCommand(updateExistingSql, conn);
+            updateExisting.Parameters.AddWithValue("@Id", existing.OrderId);
+            updateExisting.Parameters.AddWithValue("@CustomerId", floorCustomerId);
+            updateExisting.Parameters.AddWithValue("@Total", total);
+            updateExisting.Parameters.AddWithValue("@Metadata", updatedMetadataNode.ToJsonString());
+            updateExisting.Parameters.AddWithValue("@PaymentMethod", "unpaid");
+            updateExisting.Parameters.AddWithValue("@IdempotencyKey", idempotencyKey);
+            await updateExisting.ExecuteNonQueryAsync(ct);
+
+            var refreshed = await FindExistingFloorOrderAsync(conn, miniAppId, req.OrderNumber, ct) ?? existing;
+            return Results.Ok(BuildResponse(refreshed, req.OrderNumber, replay: false, ctx.TraceIdentifier));
         }
 
         const string insertSql = """
