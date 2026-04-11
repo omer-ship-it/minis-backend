@@ -3946,6 +3946,354 @@ WHERE Id = @Id;
     });
 });
 
+app.MapPost("/orders/{orderId:int}/payments", async (
+    int orderId,
+    SplitPaymentPartRequest req,
+    IConfiguration config,
+    HttpContext ctx,
+    ILogger<Program> log,
+    CancellationToken ct) =>
+{
+    static string? ResolveWriteConnectionString(IConfiguration cfg) =>
+        cfg.GetConnectionString("DefaultConnection")
+        ?? Environment.GetEnvironmentVariable("SQL_CONNECTION");
+
+    static async Task<SqlConnection> OpenConnectionAsync(IConfiguration cfg, CancellationToken token)
+    {
+        var connectionString = ResolveWriteConnectionString(cfg);
+        if (string.IsNullOrWhiteSpace(connectionString))
+        {
+            throw new InvalidOperationException("Missing write connection string. Set ConnectionStrings:DefaultConnection or SQL_CONNECTION.");
+        }
+
+        var connection = new SqlConnection(connectionString);
+        await connection.OpenAsync(token);
+        return connection;
+    }
+
+    static string NormalizePaymentMode(string? raw)
+    {
+        var value = (raw ?? "").Trim().ToLowerInvariant();
+        return value switch
+        {
+            "cash" => "cash",
+            "card" => "card",
+            _ => ""
+        };
+    }
+
+    static string NormalizePartState(string paymentMode, string? rawState, string? returnCode, string? returnMessage)
+    {
+        var state = (rawState ?? "").Trim().ToLowerInvariant();
+        if (state is "paid" or "pending" or "declined" or "cancelled")
+        {
+            return state;
+        }
+
+        if (paymentMode == "cash")
+        {
+            return "paid";
+        }
+
+        if (string.Equals((returnCode ?? "").Trim(), "0", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals((returnMessage ?? "").Trim(), "Approved", StringComparison.OrdinalIgnoreCase))
+        {
+            return "paid";
+        }
+
+        var message = (returnMessage ?? "").Trim().ToLowerInvariant();
+        if (message.Contains("cancel") || message.Contains("בוטל"))
+        {
+            return "cancelled";
+        }
+
+        return string.IsNullOrWhiteSpace(returnCode) && string.IsNullOrWhiteSpace(returnMessage)
+            ? "pending"
+            : "declined";
+    }
+
+    static decimal R2(decimal value) => Math.Round(value, 2, MidpointRounding.AwayFromZero);
+
+    static JsonObject EnsureObject(JsonObject parent, string key)
+    {
+        if (parent[key] is JsonObject existing)
+        {
+            return existing;
+        }
+
+        var created = new JsonObject();
+        parent[key] = created;
+        return created;
+    }
+
+    static JsonArray EnsureArray(JsonObject parent, string key)
+    {
+        if (parent[key] is JsonArray existing)
+        {
+            return existing;
+        }
+
+        var created = new JsonArray();
+        parent[key] = created;
+        return created;
+    }
+
+    static decimal ResolveOrderTotal(JsonObject metadataNode, decimal fallback)
+    {
+        if (metadataNode["checkout"]?["amount"] is JsonValue checkoutAmount &&
+            checkoutAmount.TryGetValue<decimal>(out var parsedCheckoutAmount) &&
+            parsedCheckoutAmount > 0)
+        {
+            return R2(parsedCheckoutAmount);
+        }
+
+        if (metadataNode["order"]?["Totals"] is JsonObject totalsNode)
+        {
+            foreach (var key in new[] { "grandTotal", "total", "totalDue", "totalCharged", "subtotal" })
+            {
+                if (totalsNode[key] is JsonValue totalsValue &&
+                    totalsValue.TryGetValue<decimal>(out var parsed) &&
+                    parsed > 0)
+                {
+                    return R2(parsed);
+                }
+            }
+        }
+
+        return R2(fallback);
+    }
+
+    static string ResolveCurrency(JsonObject metadataNode, string? preferred)
+    {
+        if (!string.IsNullOrWhiteSpace(preferred))
+        {
+            return preferred.Trim().ToUpperInvariant();
+        }
+
+        if (metadataNode["checkout"]?["currency"] is JsonValue checkoutCurrency &&
+            checkoutCurrency.TryGetValue<string>(out var parsedCheckoutCurrency) &&
+            !string.IsNullOrWhiteSpace(parsedCheckoutCurrency))
+        {
+            return parsedCheckoutCurrency.Trim().ToUpperInvariant();
+        }
+
+        if (metadataNode["order"]?["Totals"] is JsonObject totalsNode &&
+            totalsNode["currency"] is JsonValue totalsCurrency &&
+            totalsCurrency.TryGetValue<string>(out var parsedTotalsCurrency) &&
+            !string.IsNullOrWhiteSpace(parsedTotalsCurrency))
+        {
+            return parsedTotalsCurrency.Trim().ToUpperInvariant();
+        }
+
+        return "ILS";
+    }
+
+    if (orderId <= 0)
+    {
+        return Results.BadRequest(new { ok = false, error = "orderId must be > 0", traceId = ctx.TraceIdentifier });
+    }
+
+    var paymentMode = NormalizePaymentMode(req.PaymentMode);
+    if (string.IsNullOrWhiteSpace(paymentMode))
+    {
+        return Results.BadRequest(new { ok = false, error = "paymentMode must be cash or card", traceId = ctx.TraceIdentifier });
+    }
+
+    if (req.Amount <= 0)
+    {
+        return Results.BadRequest(new { ok = false, error = "amount must be > 0", traceId = ctx.TraceIdentifier });
+    }
+
+    var partIdempotencyKey = (req.IdempotencyKey ?? "").Trim();
+    if (string.IsNullOrWhiteSpace(partIdempotencyKey))
+    {
+        return Results.BadRequest(new { ok = false, error = "idempotencyKey is required", traceId = ctx.TraceIdentifier });
+    }
+
+    try
+    {
+        await using var conn = await OpenConnectionAsync(config, ct);
+
+        const string loadSql = """
+SELECT TOP (1)
+    Id,
+    MiniAppId,
+    Total,
+    Status,
+    ISNULL(PaymentMethod, 'unpaid') AS PaymentMethod,
+    ISNULL(CAST(Metadata AS nvarchar(max)), '{}') AS MetadataJson
+FROM dbo.Orders
+WHERE Id = @Id;
+""";
+
+        int miniAppId;
+        decimal existingTotal;
+        int existingStatus;
+        string existingPaymentMethod;
+        string metadataJson;
+
+        await using (var load = new SqlCommand(loadSql, conn))
+        {
+            load.Parameters.AddWithValue("@Id", orderId);
+            await using var reader = await load.ExecuteReaderAsync(ct);
+            if (!await reader.ReadAsync(ct))
+            {
+                return Results.NotFound(new { ok = false, error = "Order not found", traceId = ctx.TraceIdentifier });
+            }
+
+            miniAppId = reader.GetInt32(reader.GetOrdinal("MiniAppId"));
+            existingTotal = reader.GetDecimal(reader.GetOrdinal("Total"));
+            existingStatus = reader.GetInt32(reader.GetOrdinal("Status"));
+            existingPaymentMethod = reader.GetString(reader.GetOrdinal("PaymentMethod"));
+            metadataJson = reader.GetString(reader.GetOrdinal("MetadataJson"));
+        }
+
+        var metadataNode = JsonNode.Parse(metadataJson) as JsonObject ?? new JsonObject();
+        var paymentsNode = EnsureObject(metadataNode, "payments");
+        var summaryNode = EnsureObject(paymentsNode, "summary");
+        var partsNode = EnsureArray(paymentsNode, "parts");
+
+        foreach (var existingNode in partsNode)
+        {
+            if (existingNode is not JsonObject existingPart)
+            {
+                continue;
+            }
+
+            var existingIdempotency = existingPart["idempotencyKey"]?.GetValue<string?>();
+            if (string.Equals(existingIdempotency, partIdempotencyKey, StringComparison.Ordinal))
+            {
+                return Results.Ok(new
+                {
+                    ok = true,
+                    replay = true,
+                    orderId,
+                    miniAppId,
+                    paymentMode,
+                    summary = summaryNode,
+                    part = existingPart,
+                    traceId = ctx.TraceIdentifier
+                });
+            }
+        }
+
+        var totalAmount = ResolveOrderTotal(metadataNode, existingTotal);
+        var currency = ResolveCurrency(metadataNode, req.Currency);
+        var partState = NormalizePartState(paymentMode, req.State, req.ReturnCode, req.ReturnMessage);
+        var sequence = partsNode.Count + 1;
+        var partId = string.IsNullOrWhiteSpace(req.PartId) ? $"p{sequence}" : req.PartId.Trim();
+        var partNode = new JsonObject
+        {
+            ["partId"] = partId,
+            ["sequence"] = sequence,
+            ["method"] = paymentMode,
+            ["amount"] = R2(req.Amount),
+            ["state"] = partState,
+            ["provider"] = paymentMode == "card" ? "zcredit" : "minis",
+            ["referenceNumber"] = string.IsNullOrWhiteSpace(req.ReferenceNumber) ? null : req.ReferenceNumber,
+            ["transactionId"] = string.IsNullOrWhiteSpace(req.TransactionId) ? null : req.TransactionId,
+            ["returnCode"] = string.IsNullOrWhiteSpace(req.ReturnCode) ? null : req.ReturnCode,
+            ["returnMessage"] = string.IsNullOrWhiteSpace(req.ReturnMessage)
+                ? (paymentMode == "cash" ? "Cash accepted" : null)
+                : req.ReturnMessage,
+            ["pinpadId"] = string.IsNullOrWhiteSpace(req.PinpadId) ? null : req.PinpadId,
+            ["transactionType"] = string.IsNullOrWhiteSpace(req.TransactionType) ? null : req.TransactionType,
+            ["idempotencyKey"] = partIdempotencyKey,
+            ["createdAtUtc"] = DateTime.UtcNow.ToString("O"),
+            ["updatedAtUtc"] = DateTime.UtcNow.ToString("O")
+        };
+        partsNode.Add(partNode);
+
+        decimal paidAmount = 0m;
+        foreach (var existingNode in partsNode)
+        {
+            if (existingNode is not JsonObject existingPart)
+            {
+                continue;
+            }
+
+            var state = existingPart["state"]?.GetValue<string?>();
+            if (!string.Equals(state, "paid", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            if (existingPart["amount"] is JsonValue amountNode &&
+                amountNode.TryGetValue<decimal>(out var existingAmount))
+            {
+                paidAmount += existingAmount;
+            }
+        }
+
+        paidAmount = R2(paidAmount);
+        var remainingAmount = R2(Math.Max(0m, totalAmount - paidAmount));
+        var fullyPaid = totalAmount > 0m && remainingAmount == 0m;
+
+        summaryNode["totalAmount"] = totalAmount;
+        summaryNode["currency"] = currency;
+        summaryNode["paidAmount"] = paidAmount;
+        summaryNode["remainingAmount"] = remainingAmount;
+        summaryNode["fullyPaid"] = fullyPaid;
+        summaryNode["partCount"] = partsNode.Count;
+        summaryNode["updatedAtUtc"] = DateTime.UtcNow.ToString("O");
+
+        var checkoutNode = EnsureObject(metadataNode, "checkout");
+        var previousState = checkoutNode["state"]?.GetValue<string?>();
+        checkoutNode["state"] = fullyPaid ? "paid" : paidAmount > 0m ? "partially_paid" : previousState ?? "pending";
+        checkoutNode["amount"] = totalAmount;
+        checkoutNode["currency"] = currency;
+        checkoutNode["updatedAtUtc"] = DateTime.UtcNow.ToString("O");
+
+        const string updateSql = """
+UPDATE dbo.Orders
+SET
+    Status = @Status,
+    PaymentMethod = @PaymentMethod,
+    PaymentReference = @PaymentReference,
+    PaymentApprovedAtUtc = @PaymentApprovedAtUtc,
+    Metadata = @Metadata,
+    UpdatedAt = SYSUTCDATETIME()
+WHERE Id = @Id;
+""";
+
+        await using var update = new SqlCommand(updateSql, conn);
+        update.Parameters.AddWithValue("@Id", orderId);
+        update.Parameters.AddWithValue("@Status", fullyPaid ? 1 : existingStatus);
+        update.Parameters.AddWithValue("@PaymentMethod", fullyPaid ? (partsNode.Count > 1 ? "split" : paymentMode) : existingPaymentMethod);
+        update.Parameters.AddWithValue("@PaymentReference", (object?)req.ReferenceNumber ?? DBNull.Value);
+        update.Parameters.AddWithValue("@PaymentApprovedAtUtc", fullyPaid ? DateTime.UtcNow : DBNull.Value);
+        update.Parameters.AddWithValue("@Metadata", metadataNode.ToJsonString());
+        await update.ExecuteNonQueryAsync(ct);
+
+        log.LogInformation(
+            "Saved split payment part orderId={OrderId} miniAppId={MiniAppId} method={Method} amount={Amount} state={State} idem={Idem} fullyPaid={FullyPaid} trace={Trace}",
+            orderId, miniAppId, paymentMode, req.Amount, partState, partIdempotencyKey, fullyPaid, ctx.TraceIdentifier);
+
+        return Results.Ok(new
+        {
+            ok = true,
+            replay = false,
+            orderId,
+            miniAppId,
+            paymentMode,
+            summary = summaryNode,
+            part = partNode,
+            traceId = ctx.TraceIdentifier
+        });
+    }
+    catch (Exception ex)
+    {
+        log.LogError(ex, "Split payment endpoint failed orderId={OrderId} trace={Trace}", orderId, ctx.TraceIdentifier);
+        return Results.Json(new
+        {
+            ok = false,
+            error = ex.Message,
+            type = ex.GetType().FullName,
+            traceId = ctx.TraceIdentifier
+        }, statusCode: 500);
+    }
+});
+
 app.MapControllers();
 
 app.Run();
@@ -3990,6 +4338,20 @@ internal record CheckoutOfflineSettleRequest(
 internal record ZcreditCancelRequest(
     string? StreamId,
     string? PinpadId);
+
+internal record SplitPaymentPartRequest(
+    string? PaymentMode,
+    decimal Amount,
+    string? Currency,
+    string? IdempotencyKey,
+    string? PartId = null,
+    string? State = null,
+    string? ReferenceNumber = null,
+    string? TransactionId = null,
+    string? ReturnCode = null,
+    string? ReturnMessage = null,
+    string? PinpadId = null,
+    string? TransactionType = null);
 
 internal record PrintLogFinalRequest(
     string? DedupeKey,
