@@ -3527,6 +3527,23 @@ app.MapPost("/orders/submit", async (
             PinpadId: req.Payment?.PinpadId ?? req.PinpadId,
             TransactionType: req.Payment?.TransactionType ?? req.TransactionType);
     }
+    else if (req.CheckoutOrderId.HasValue && req.CheckoutOrderId.Value > 0)
+    {
+        targetPath = $"/orders/{req.CheckoutOrderId.Value}/payments";
+        payload = new SplitPaymentPartRequest(
+            PaymentMode: paymentMode,
+            Amount: req.Payment?.Amount ?? req.Amount ?? 0m,
+            Currency: req.Payment?.Currency ?? req.Currency,
+            IdempotencyKey: req.IdempotencyKey,
+            PartId: null,
+            State: null,
+            ReferenceNumber: req.Payment?.ReferenceNumber ?? req.ReferenceNumber,
+            TransactionId: req.Payment?.TransactionId ?? req.TransactionId,
+            ReturnCode: req.Payment?.ReturnCode ?? req.ReturnCode,
+            ReturnMessage: req.Payment?.ReturnMessage ?? req.ReturnMessage,
+            PinpadId: req.Payment?.PinpadId ?? req.PinpadId,
+            TransactionType: req.Payment?.TransactionType ?? req.TransactionType);
+    }
     else if (paymentMode == "card")
     {
         targetPath = "/checkout/zcredit/card";
