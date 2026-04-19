@@ -2348,6 +2348,7 @@ app.MapPost("/checkout/offline/settle", async (
                     IdempotencyKey = string.IsNullOrWhiteSpace(incoming.IdempotencyKey) ? existing.IdempotencyKey : incoming.IdempotencyKey,
                     DiningMode = string.IsNullOrWhiteSpace(incoming.DiningMode) ? existing.DiningMode : incoming.DiningMode,
                     Service = string.IsNullOrWhiteSpace(incoming.Service) ? existing.Service : incoming.Service,
+                    PickupLocation = string.IsNullOrWhiteSpace(incoming.PickupLocation) ? existing.PickupLocation : incoming.PickupLocation,
                     Totals = incoming.Totals ?? existing.Totals,
                     Device = incoming.Device ?? existing.Device,
                     Notifications = incoming.Notifications ?? existing.Notifications,
@@ -4481,6 +4482,7 @@ internal record CheckoutOrderPayload(
     string? Phone = null,
     string? DiningMode = null,
     string? Service = null,
+    string? PickupLocation = null,
     JsonElement? Totals = null,
     JsonElement? Device = null,
     JsonElement? Notifications = null,
@@ -4937,6 +4939,11 @@ internal static class SubmitOrderHelper
         if (!string.IsNullOrWhiteSpace(order.DiningMode))
         {
             payload["diningMode"] = order.DiningMode;
+        }
+
+        if (!string.IsNullOrWhiteSpace(order.PickupLocation))
+        {
+            payload["pickupLocation"] = order.PickupLocation;
         }
 
         if (CloneNode(order.Device) is JsonNode deviceNode)
