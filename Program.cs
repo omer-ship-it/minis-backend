@@ -5109,8 +5109,17 @@ internal sealed class RealZcreditGateway(IConfiguration config, ILogger log) : I
         // This is intentionally config-driven and conservative so we can finish the
         // integration before we have the physical terminal in hand.
         var baseUrl = config["ZCredit:BaseUrl"];
-        var terminal = string.IsNullOrWhiteSpace(request.Tpn) ? config["ZCredit:TerminalNumber"] : request.Tpn;
-        var password = config["ZCredit:Password"];
+        var miniAppSection = config.GetSection($"ZCredit:MiniApps:{request.MiniAppId}");
+        var configuredMiniAppTerminal = miniAppSection["TerminalNumber"];
+        var configuredMiniAppPassword = miniAppSection["Password"];
+        var terminal =
+            string.IsNullOrWhiteSpace(request.Tpn)
+                ? (string.IsNullOrWhiteSpace(configuredMiniAppTerminal) ? config["ZCredit:TerminalNumber"] : configuredMiniAppTerminal)
+                : request.Tpn;
+        var password =
+            string.IsNullOrWhiteSpace(configuredMiniAppPassword)
+                ? config["ZCredit:Password"]
+                : configuredMiniAppPassword;
         var pinpad = string.IsNullOrWhiteSpace(request.PinpadId) ? config["ZCredit:PinpadId"] : request.PinpadId;
         var timeoutSeconds = int.TryParse(config["ZCredit:TimeoutSeconds"], out var parsedTimeout) && parsedTimeout > 0
             ? parsedTimeout
