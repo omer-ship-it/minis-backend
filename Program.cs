@@ -669,6 +669,7 @@ WHERE Id = @Id;
             IdempotencyKey: idempotencyKey,
             TransactionType: transactionType,
             PinpadId: req.PinpadId,
+            Tpn: req.Tpn,
             DebugOutcome: req.DebugOutcome), token);
 
         var finalMemory = pendingMemory with
@@ -806,6 +807,7 @@ WHERE Id = @Id;
             IdempotencyKey: idempotencyKey,
             TransactionType: transactionType,
             PinpadId: req.PinpadId,
+            Tpn: req.Tpn,
             DebugOutcome: req.DebugOutcome), ct);
 
         await UpdateOrderAsync(
@@ -3555,6 +3557,7 @@ app.MapPost("/orders/submit", async (
             IdempotencyKey: req.IdempotencyKey,
             TransactionType: req.Payment?.TransactionType ?? req.TransactionType,
             PinpadId: req.Payment?.PinpadId ?? req.PinpadId,
+            Tpn: req.Payment?.Tpn ?? req.Tpn,
             DebugOutcome: req.DebugOutcome,
             Order: req.Order);
     }
@@ -4323,6 +4326,7 @@ internal record CheckoutZcreditCardRequest(
     string? IdempotencyKey,
     string? TransactionType,
     string? PinpadId,
+    string? Tpn,
     string? DebugOutcome,
     CheckoutOrderPayload? Order);
 
@@ -4412,6 +4416,7 @@ internal record OrdersSubmitRequest(
     string? ReturnCode,
     string? ReturnMessage,
     string? PinpadId,
+    string? Tpn,
     string? TransactionType,
     string? DebugOutcome,
     OrdersSubmitPayment? Payment,
@@ -4427,6 +4432,7 @@ internal record OrdersSubmitPayment(
     string? ReturnCode,
     string? ReturnMessage,
     string? PinpadId,
+    string? Tpn,
     string? TransactionType);
 
 internal record FloorSendOrderRequest(
@@ -4599,6 +4605,7 @@ internal record GatewayCommitRequest(
     string IdempotencyKey,
     string TransactionType,
     string? PinpadId,
+    string? Tpn,
     string? DebugOutcome);
 
 internal record GatewayReconcileRequest(
@@ -5102,7 +5109,7 @@ internal sealed class RealZcreditGateway(IConfiguration config, ILogger log) : I
         // This is intentionally config-driven and conservative so we can finish the
         // integration before we have the physical terminal in hand.
         var baseUrl = config["ZCredit:BaseUrl"];
-        var terminal = config["ZCredit:TerminalNumber"];
+        var terminal = string.IsNullOrWhiteSpace(request.Tpn) ? config["ZCredit:TerminalNumber"] : request.Tpn;
         var password = config["ZCredit:Password"];
         var pinpad = string.IsNullOrWhiteSpace(request.PinpadId) ? config["ZCredit:PinpadId"] : request.PinpadId;
         var timeoutSeconds = int.TryParse(config["ZCredit:TimeoutSeconds"], out var parsedTimeout) && parsedTimeout > 0
@@ -5163,8 +5170,8 @@ internal sealed class RealZcreditGateway(IConfiguration config, ILogger log) : I
         catch (TaskCanceledException ex) when (!ct.IsCancellationRequested)
         {
             log.LogWarning(ex,
-                "Real gateway commit timed out miniAppId={MiniAppId} idem={Idem} pinpadId={PinpadId}",
-                request.MiniAppId, request.IdempotencyKey, pinpad);
+                "Real gateway commit timed out miniAppId={MiniAppId} idem={Idem} terminal={Terminal} pinpadId={PinpadId}",
+                request.MiniAppId, request.IdempotencyKey, terminal, pinpad);
             return new GatewayResult("pending", null, null, "CommitTimeout", $"Gateway request timed out after {timeoutSeconds} seconds");
         }
     }
