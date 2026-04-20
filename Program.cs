@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text.Json.Nodes;
 using System.Text.Json;
@@ -614,7 +615,7 @@ WHERE Id = @Id;
     var allowMemoryFallback = AllowMemoryFallback(config, app.Environment);
     var submitMode = ResolveSubmitMode(config, app.Environment);
     var normalizedOrder = req.Order with { Source = NormalizeSource(req.Order.Source) };
-    var gateway = ZcreditGatewayFactory.Create(config, log);
+    var gateway = ZcreditGatewayFactory.Create(config, log, httpFactory);
 
     SqlConnection? conn = null;
     string? storageWarning = null;
@@ -676,8 +677,6 @@ WHERE Id = @Id;
                 _ => Results.Json(BuildMemoryCheckoutResponse(raced, replay: true, traceId, "memory", storageWarning), statusCode: 202)
             };
         }
-
-        await Task.Delay(TimeSpan.FromMilliseconds(150), token);
 
         var gatewayResult = await gateway.CommitAsync(new GatewayCommitRequest(
             MiniAppId: miniAppId,
@@ -796,7 +795,12 @@ WHERE Id = @Id;
         int orderId;
         try
         {
+            var insertStopwatch = Stopwatch.StartNew();
             orderId = await InsertPendingOrderAsync(conn, req, normalizedOrder, miniAppId, idempotencyKey, amount, currency, transactionType, ct);
+            insertStopwatch.Stop();
+            log.LogInformation(
+                "Checkout pending row inserted miniAppId={MiniAppId} idem={Idem} orderId={OrderId} amount={Amount} txType={TxType} insertMs={InsertMs} trace={Trace}",
+                miniAppId, idempotencyKey, orderId, amount, transactionType, insertStopwatch.ElapsedMilliseconds, traceId);
         }
         catch (SqlException ex) when (ex.Number is 2601 or 2627)
         {
@@ -810,13 +814,7 @@ WHERE Id = @Id;
 
             throw;
         }
-
-        log.LogInformation(
-            "Checkout pending row inserted miniAppId={MiniAppId} idem={Idem} orderId={OrderId} amount={Amount} txType={TxType} trace={Trace}",
-            miniAppId, idempotencyKey, orderId, amount, transactionType, traceId);
-
-        await Task.Delay(TimeSpan.FromMilliseconds(150), ct);
-
+        var gatewayStopwatch = Stopwatch.StartNew();
         var gatewayResult = await gateway.CommitAsync(new GatewayCommitRequest(
             MiniAppId: miniAppId,
             OrderId: orderId,
@@ -827,6 +825,10 @@ WHERE Id = @Id;
             PinpadId: req.PinpadId,
             Tpn: req.Tpn,
             DebugOutcome: req.DebugOutcome), ct);
+        gatewayStopwatch.Stop();
+        log.LogInformation(
+            "Checkout gateway commit finished miniAppId={MiniAppId} idem={Idem} orderId={OrderId} state={State} gatewayMs={GatewayMs} trace={Trace}",
+            miniAppId, idempotencyKey, orderId, gatewayResult.CheckoutState, gatewayStopwatch.ElapsedMilliseconds, traceId);
 
         await UpdateOrderAsync(
             conn,
@@ -5064,11 +5066,11 @@ internal static class SubmitOrderHelper
 
 internal static class ZcreditGatewayFactory
 {
-    public static IZcreditGateway Create(IConfiguration config, ILogger log)
+    public static IZcreditGateway Create(IConfiguration config, ILogger log, IHttpClientFactory? httpClientFactory = null)
     {
         var mode = (config["CheckoutDebug:GatewayMode"] ?? "fake").Trim().ToLowerInvariant();
         return mode == "real"
-            ? new RealZcreditGateway(config, log)
+            ? new RealZcreditGateway(config, log, httpClientFactory)
             : new FakeZcreditGateway(log);
     }
 }
@@ -5120,7 +5122,7 @@ internal sealed class FakeZcreditGateway(ILogger log) : IZcreditGateway
         };
 }
 
-internal sealed class RealZcreditGateway(IConfiguration config, ILogger log) : IZcreditGateway
+internal sealed class RealZcreditGateway(IConfiguration config, ILogger log, IHttpClientFactory? httpClientFactory) : IZcreditGateway
 {
     public async Task<GatewayResult> CommitAsync(GatewayCommitRequest request, CancellationToken ct)
     {
@@ -5155,7 +5157,8 @@ internal sealed class RealZcreditGateway(IConfiguration config, ILogger log) : I
             throw new InvalidOperationException("Real gateway mode requires ZCredit:BaseUrl, TerminalNumber, Password, and PinpadId.");
         }
 
-        using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(timeoutSeconds) };
+        using var http = httpClientFactory?.CreateClient(nameof(RealZcreditGateway)) ?? new HttpClient();
+        http.Timeout = TimeSpan.FromSeconds(timeoutSeconds);
         var payload = new
         {
             TerminalNumber = terminal,
