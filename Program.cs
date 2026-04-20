@@ -75,7 +75,25 @@ app.MapGet("/debug/config", (IConfiguration cfg) => Results.Ok(new
         cfg["WEBSITE_SITE_NAME"],
 
     websiteSlotName =
-        cfg["WEBSITE_SLOT_NAME"]
+        cfg["WEBSITE_SLOT_NAME"],
+
+    hasZCreditBaseUrl =
+        !string.IsNullOrWhiteSpace(cfg["ZCredit:BaseUrl"]),
+
+    hasZCreditTerminalNumber =
+        !string.IsNullOrWhiteSpace(cfg["ZCredit:TerminalNumber"]),
+
+    hasZCreditPassword =
+        !string.IsNullOrWhiteSpace(cfg["ZCredit:Password"]),
+
+    hasZCreditMiniApp13TerminalNumber =
+        !string.IsNullOrWhiteSpace(cfg["ZCredit:MiniApps:13:TerminalNumber"]),
+
+    hasZCreditMiniApp13Password =
+        !string.IsNullOrWhiteSpace(cfg["ZCredit:MiniApps:13:Password"]),
+
+    hasZCreditTerminal2679742012Password =
+        !string.IsNullOrWhiteSpace(cfg["ZCredit:Terminals:2679742012:Password"])
 }));
 
 app.MapGet("/debug/host", () => Results.Ok(new
@@ -5116,10 +5134,14 @@ internal sealed class RealZcreditGateway(IConfiguration config, ILogger log) : I
             string.IsNullOrWhiteSpace(request.Tpn)
                 ? (string.IsNullOrWhiteSpace(configuredMiniAppTerminal) ? config["ZCredit:TerminalNumber"] : configuredMiniAppTerminal)
                 : request.Tpn;
+        var terminalSection = string.IsNullOrWhiteSpace(terminal) ? null : config.GetSection($"ZCredit:Terminals:{terminal}");
+        var configuredTerminalPassword = terminalSection?["Password"];
         var password =
-            string.IsNullOrWhiteSpace(configuredMiniAppPassword)
-                ? config["ZCredit:Password"]
-                : configuredMiniAppPassword;
+            !string.IsNullOrWhiteSpace(configuredMiniAppPassword)
+                ? configuredMiniAppPassword
+                : (!string.IsNullOrWhiteSpace(configuredTerminalPassword)
+                    ? configuredTerminalPassword
+                    : config["ZCredit:Password"]);
         var pinpad = string.IsNullOrWhiteSpace(request.PinpadId) ? config["ZCredit:PinpadId"] : request.PinpadId;
         var timeoutSeconds = int.TryParse(config["ZCredit:TimeoutSeconds"], out var parsedTimeout) && parsedTimeout > 0
             ? parsedTimeout
@@ -5148,6 +5170,14 @@ internal sealed class RealZcreditGateway(IConfiguration config, ILogger log) : I
 
         try
         {
+            log.LogInformation(
+                "ZCredit commit config miniAppId={MiniAppId} terminal={Terminal} passwordSource={PasswordSource} pinpadId={PinpadId}",
+                request.MiniAppId,
+                terminal,
+                !string.IsNullOrWhiteSpace(configuredMiniAppPassword)
+                    ? "miniapp"
+                    : (!string.IsNullOrWhiteSpace(configuredTerminalPassword) ? "terminal" : "global"),
+                pinpad);
             var response = await http.PostAsJsonAsync($"{baseUrl.TrimEnd('/')}/Transaction/CommitFullTransaction", payload, ct);
             var text = await response.Content.ReadAsStringAsync(ct);
 
