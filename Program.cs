@@ -4776,8 +4776,17 @@ internal static class SubmitOrderHelper
         int? existingSubmittedOrderId,
         CancellationToken ct)
     {
-        var mode = ResolveMode(config, env);
         var attemptedAtUtc = DateTime.UtcNow;
+        var forwardingDisabled = string.Equals("disabled", "disabled", StringComparison.Ordinal);
+        if (forwardingDisabled)
+        {
+            log.LogInformation(
+                "submitOrder forwarding hard-disabled miniAppId={MiniAppId} checkoutOrderId={CheckoutOrderId} idem={Idem}",
+                miniAppId, checkoutOrderId, idempotencyKey);
+            return new SubmitOrderAttemptResult("not_started", null, null, null, null, attemptedAtUtc, null, null, null, null, null);
+        }
+
+        var mode = ResolveMode(config, env);
 
         if (mode == "off")
         {
